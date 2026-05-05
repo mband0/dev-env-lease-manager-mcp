@@ -26,6 +26,12 @@ python3 -m dev_env_lease_manager.mcp_server --config config/environments.json
 - `dev_env_events`
 - `dev_env_deploy_worktree`
 
+`dev_env_deploy_worktree` is the normal dev promotion tool. For environments
+with `metadata.deploy_mode = "native"`, the MCP server itself performs the
+persistent dev checkout promotion, build, PM2 restart, health check, served
+commit verification, and lease transition. Environments can still opt into the
+legacy external command path with `metadata.deploy_mode = "command"`.
+
 Busy environment responses include owner task, agent, branch, commit, lease id,
 environment, and next action guidance. Agents must treat `environment_busy` as a
 blocked/waiting state and must not mutate the shared checkout manually.

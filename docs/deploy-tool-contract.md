@@ -29,9 +29,14 @@ Equivalent CLI:
 python3 -B -m dev_env_lease_manager.cli --config /Users/nordini/dev-environment-lease-manager/config/environments.json deploy agent-hq-dev --task-id 426 --actor cinder-backend --source-repo-path /Users/nordini/.openclaw/workspace-cinder/agent-hq --branch cinder/task-426 --commit abc123
 ```
 
-The deploy path acquires a lease, marks it `deploying`, runs the configured
-deployment command, verifies the served commit, and marks `deployed_for_qa` only
-after verification succeeds.
+The deploy path acquires a lease, marks it `deploying`, promotes the exact clean
+source `HEAD` into the configured persistent dev checkout, builds and restarts
+the configured services, verifies the served commit, and marks
+`deployed_for_qa` only after verification succeeds.
+
+For Agent HQ dev, this deploy behavior is native to the MCP server through
+`metadata.deploy_mode = "native"`. The older shell-command path remains
+available only when an environment explicitly sets deploy mode to `command`.
 
 ## Busy Or Missing Environment
 

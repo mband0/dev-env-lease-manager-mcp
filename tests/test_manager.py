@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from dev_env_lease_manager.config import load_config
 from dev_env_lease_manager.manager import LeaseManager
@@ -13,7 +14,8 @@ from dev_env_lease_manager.manager import LeaseManager
 
 class ManagerTestCase(unittest.TestCase):
     def make_manager(self, stale_after_seconds: int = 3600, deploy_command: str | None = None,
-                     served_commit_command: str | None = None) -> tuple[LeaseManager, tempfile.TemporaryDirectory[str]]:
+                     served_commit_command: str | None = None,
+                     metadata: dict[str, object] | None = None) -> tuple[LeaseManager, tempfile.TemporaryDirectory[str]]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         payload = {
@@ -27,6 +29,7 @@ class ManagerTestCase(unittest.TestCase):
                     "stale_after_seconds": stale_after_seconds,
                     "deploy_command": deploy_command,
                     "served_commit_command": served_commit_command,
+                    "metadata": metadata or {},
                 }
             ],
         }
@@ -206,6 +209,27 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["release_reason"], "deploy_failed")
         self.assertTrue(manager.status()["environments"][0]["available"])
+
+    def test_lease_aware_deploy_uses_native_mcp_deploy_when_configured(self) -> None:
+        manager, tmp = self.make_manager(
+            deploy_command="python3 -c 'raise SystemExit(99)'",
+            metadata={"deploy_mode": "native"},
+        )
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+
+        with patch("dev_env_lease_manager.manager.NativeDevDeployer") as deployer_class:
+            deployer_class.return_value.deploy.return_value = {
+                "ok": True,
+                "mode": "native",
+                "source_sha": "abc123",
+            }
+            result = manager.lease_aware_deploy("agent-hq-dev", "426", "cinder", str(source), commit="abc123")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "deployed_for_qa")
+        self.assertEqual(result["deploy"]["mode"], "native")
+        deployer_class.return_value.deploy.assert_called_once()
 
 
 if __name__ == "__main__":

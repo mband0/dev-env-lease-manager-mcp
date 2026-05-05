@@ -6,6 +6,11 @@ This repo is intentionally separate from Agent HQ core. It protects shared dev
 deployments from concurrent overwrites while Agent HQ remains the task and
 evidence system.
 
+The MCP server also owns the normal Agent HQ dev promotion path. Its
+`dev_env_deploy_worktree` tool can natively promote a clean source checkout into
+the persistent dev checkout, build/restart the configured PM2 services, verify
+health and served commit, then keep the lease locked for QA.
+
 ## Quick Start
 
 ```sh

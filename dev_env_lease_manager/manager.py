@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from .config import LeaseManagerConfig
 from .db import connect, sync_environments
+from .deploy import NativeDeployError, NativeDevDeployer
 from .models import ACTIVE_STATUSES, ALLOWED_TRANSITIONS, RELEASE_REASON_ALLOWED_FROM, RELEASE_REASON_TO_STATUS
 
 
@@ -368,14 +369,58 @@ class LeaseManager:
         deploying = self.transition(lease_id, "mark_deploying", actor)
         if not deploying.get("ok"):
             return deploying
-        command = env.get("deploy_command")
         if dry_run:
             deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"dry_run": True, "served_commit": commit})
             deployed["deploy"] = {"dry_run": True}
             return deployed
-        if not command:
-            return self.release(lease_id, actor, "deploy_failed", "No deploy_command configured")
 
+        metadata = env.get("metadata") or {}
+        deploy_mode = str(metadata.get("deploy_mode") or ("command" if env.get("deploy_command") else "native")).strip().lower()
+        if deploy_mode == "command":
+            deploy_payload = self._command_deploy(env, lease_id, environment_id, task_id, actor, source_repo_path, commit, services, health_check, timeout_seconds)
+            if not deploy_payload.get("ok"):
+                released = self.release(lease_id, actor, "deploy_failed", deploy_payload.get("message") or deploy_payload.get("stderr") or "deploy command failed")
+                released["deploy"] = deploy_payload
+                return released
+        else:
+            try:
+                deploy_payload = NativeDevDeployer().deploy(
+                    env,
+                    source_repo_path,
+                    services=services,
+                    health_check=health_check,
+                    expected_commit=commit,
+                    timeout_seconds=timeout_seconds,
+                )
+            except NativeDeployError as exc:
+                deploy_payload = exc.payload()
+                released = self.release(lease_id, actor, "deploy_failed", deploy_payload.get("error", "native deploy failed"))
+                released["deploy"] = deploy_payload
+                return released
+
+        served_commit = commit
+        served_cmd = env.get("served_commit_command")
+        if served_cmd:
+            served = subprocess.run(served_cmd, shell=True, text=True, capture_output=True, timeout=60)
+            if served.returncode != 0:
+                released = self.release(lease_id, actor, "deploy_failed", served.stderr[-1000:] or "served commit command failed")
+                released["deploy"] = deploy_payload
+                return released
+            served_commit = served.stdout.strip()
+        if commit and served_commit and commit != served_commit:
+            released = self.release(lease_id, actor, "deploy_failed", f"served commit {served_commit} did not match expected {commit}")
+            released["deploy"] = deploy_payload
+            return released
+        deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"served_commit": served_commit, "deploy": deploy_payload})
+        deployed["deploy"] = deploy_payload
+        return deployed
+
+    def _command_deploy(self, env: Dict[str, Any], lease_id: str, environment_id: str, task_id: str,
+                        actor: str, source_repo_path: str, commit: Optional[str], services: str,
+                        health_check: bool, timeout_seconds: int) -> Dict[str, Any]:
+        command = env.get("deploy_command")
+        if not command:
+            return {"ok": False, "message": "No deploy_command configured"}
         proc_env = os.environ.copy()
         proc_env.update({
             "repo_path": source_repo_path,
@@ -383,6 +428,7 @@ class LeaseManager:
             "DEV_LEASE_ID": lease_id,
             "DEV_LEASE_ENVIRONMENT_ID": environment_id,
             "DEV_LEASE_TASK_ID": str(task_id),
+            "DEV_LEASE_ACTOR": actor,
             "DEV_LEASE_COMMIT": commit or "",
             "services": services,
             "SERVICES": services,
@@ -401,25 +447,10 @@ class LeaseManager:
             capture_output=True,
             timeout=timeout_seconds,
         )
-        deploy_payload = {"returncode": completed.returncode, "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-4000:]}
-        if completed.returncode != 0:
-            released = self.release(lease_id, actor, "deploy_failed", completed.stderr[-1000:] or "deploy command failed")
-            released["deploy"] = deploy_payload
-            return released
-
-        served_commit = commit
-        served_cmd = env.get("served_commit_command")
-        if served_cmd:
-            served = subprocess.run(served_cmd, shell=True, text=True, capture_output=True, timeout=60)
-            if served.returncode != 0:
-                released = self.release(lease_id, actor, "deploy_failed", served.stderr[-1000:] or "served commit command failed")
-                released["deploy"] = deploy_payload
-                return released
-            served_commit = served.stdout.strip()
-        if commit and served_commit and commit != served_commit:
-            released = self.release(lease_id, actor, "deploy_failed", f"served commit {served_commit} did not match expected {commit}")
-            released["deploy"] = deploy_payload
-            return released
-        deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"served_commit": served_commit, "deploy": deploy_payload})
-        deployed["deploy"] = deploy_payload
-        return deployed
+        return {
+            "ok": completed.returncode == 0,
+            "mode": "command",
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+        }

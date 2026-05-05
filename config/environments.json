@@ -16,6 +16,9 @@
       "stale_after_seconds": 7200,
       "tags": ["agent-hq", "dev", "shared-checkout"],
       "metadata": {
+        "deploy_mode": "native",
+        "canonical_root": "/Users/nordini/agent-hq",
+        "state_dir": "~/.agent-hq-dev-deploy",
         "api_port": 3511,
         "ui_port": 3510,
         "pm2_api": "agent-hq-dev-api",
@@ -24,4 +27,3 @@
     }
   ]
 }
-
