@@ -32,6 +32,9 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("dev_env_acquire", names)
         self.assertIn("dev_env_deploy_worktree", names)
         self.assertIn("dev_env_validate_qa", names)
+        self.assertIn("dev_env_mark_qa_failed", names)
+        self.assertIn("dev_env_mark_prod_failed", names)
+        self.assertIn("dev_env_mark_done", names)
 
     def test_calls_tool_and_returns_structured_json_content(self) -> None:
         server, _, _ = self.make_server()
@@ -55,7 +58,32 @@ class McpServerTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["lease"]["task_id"], "426")
 
+    def test_named_release_tools_call_state_machine_reasons(self) -> None:
+        server, manager, _ = self.make_server()
+        lease = manager.acquire("agent-hq-dev", "426", "cinder", commit="abc123")["lease"]
+        manager.transition(lease["id"], "mark_deploying", "deploy")
+        manager.transition(lease["id"], "mark_deployed_for_qa", "deploy")
+
+        response = server.handle({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "dev_env_mark_qa_failed",
+                "arguments": {
+                    "lease_id": lease["id"],
+                    "actor": "qa",
+                    "message": "regression failed",
+                },
+            },
+        })
+
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "qa_failed")
+        self.assertEqual(payload["release_reason"], "qa_failed")
+
 
 if __name__ == "__main__":
     unittest.main()
-

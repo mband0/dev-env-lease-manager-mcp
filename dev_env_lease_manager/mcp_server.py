@@ -55,6 +55,26 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "reason": {"type": "string"},
         "message": {"type": "string"},
     }, ["lease_id", "actor", "reason"]),
+    "dev_env_mark_deploy_failed": tool_schema("Release a lease after dev deployment fails.", {
+        "lease_id": {"type": "string"},
+        "actor": {"type": "string"},
+        "message": {"type": "string"},
+    }, ["lease_id", "actor"]),
+    "dev_env_mark_qa_failed": tool_schema("Release a lease after QA fails.", {
+        "lease_id": {"type": "string"},
+        "actor": {"type": "string"},
+        "message": {"type": "string"},
+    }, ["lease_id", "actor"]),
+    "dev_env_mark_prod_failed": tool_schema("Release a lease after production deployment fails.", {
+        "lease_id": {"type": "string"},
+        "actor": {"type": "string"},
+        "message": {"type": "string"},
+    }, ["lease_id", "actor"]),
+    "dev_env_mark_done": tool_schema("Release a lease after production succeeds and task is done.", {
+        "lease_id": {"type": "string"},
+        "actor": {"type": "string"},
+        "message": {"type": "string"},
+    }, ["lease_id", "actor"]),
     "dev_env_force_release": tool_schema("Force release an active lease with explicit actor and reason.", {
         "lease_id": {"type": "string"},
         "environment_id": {"type": "string"},
@@ -106,6 +126,10 @@ class McpServer:
             "dev_env_mark_deployed_for_qa": lambda a: self.manager.transition(a["lease_id"], "mark_deployed_for_qa", a["actor"], {"served_commit": a.get("served_commit")}),
             "dev_env_mark_prod_deploying": lambda a: self.manager.transition(a["lease_id"], "mark_prod_deploying", a["actor"]),
             "dev_env_release": lambda a: self.manager.release(a["lease_id"], a["actor"], a["reason"], a.get("message")),
+            "dev_env_mark_deploy_failed": lambda a: self.manager.release(a["lease_id"], a["actor"], "deploy_failed", a.get("message")),
+            "dev_env_mark_qa_failed": lambda a: self.manager.release(a["lease_id"], a["actor"], "qa_failed", a.get("message")),
+            "dev_env_mark_prod_failed": lambda a: self.manager.release(a["lease_id"], a["actor"], "prod_failed", a.get("message")),
+            "dev_env_mark_done": lambda a: self.manager.release(a["lease_id"], a["actor"], "done", a.get("message")),
             "dev_env_force_release": lambda a: self.manager.force_release(a["actor"], a["reason"], a.get("lease_id"), a.get("environment_id")),
             "dev_env_heartbeat": lambda a: self.manager.heartbeat(a["lease_id"], a["actor"]),
             "dev_env_sweep_stale": lambda a: self.manager.sweep_stale(a["actor"]),
@@ -210,4 +234,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

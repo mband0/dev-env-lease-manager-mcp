@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from .config import LeaseManagerConfig
 from .db import connect, sync_environments
-from .models import ACTIVE_STATUSES, ALLOWED_TRANSITIONS, RELEASE_REASON_TO_STATUS
+from .models import ACTIVE_STATUSES, ALLOWED_TRANSITIONS, RELEASE_REASON_ALLOWED_FROM, RELEASE_REASON_TO_STATUS
 
 
 def utc_now() -> str:
@@ -217,6 +217,16 @@ class LeaseManager:
             return {"ok": False, "error": "lease_not_found", "lease_id": lease_id}
         if lease["status"] not in ACTIVE_STATUSES:
             return {"ok": False, "error": "lease_not_active", "lease": lease}
+        allowed_from = RELEASE_REASON_ALLOWED_FROM[reason]
+        if lease["status"] not in allowed_from:
+            return {
+                "ok": False,
+                "error": "invalid_release_transition",
+                "lease_id": lease_id,
+                "from_status": lease["status"],
+                "release_reason": reason,
+                "allowed_from": sorted(allowed_from),
+            }
 
         to_status = RELEASE_REASON_TO_STATUS[reason]
         from_status = lease["status"]
@@ -227,7 +237,7 @@ class LeaseManager:
         )
         self._event(lease_id, lease["environment_id"], lease["task_id"], actor, "release", from_status, to_status, reason, message)
         updated = self._lease(lease_id)
-        return {"ok": True, "status": to_status, "lease": updated, "release_reason": reason, "agent_hq_note": self.release_note(updated)}
+        return {"ok": True, "status": to_status, "lease": updated, "release_reason": reason, "agent_hq_note": self.release_note(updated, message)}
 
     def force_release(self, actor: str, reason: str, lease_id: Optional[str] = None,
                       environment_id: Optional[str] = None) -> Dict[str, Any]:
@@ -326,17 +336,20 @@ class LeaseManager:
             },
         }
 
-    def release_note(self, lease: Optional[Dict[str, Any]]) -> Optional[str]:
+    def release_note(self, lease: Optional[Dict[str, Any]], message: Optional[str] = None) -> Optional[str]:
         if not lease:
             return None
-        return (
+        lines = [
             "Dev environment lease released\n"
             f"Lease: {lease['id']}\n"
             f"Environment: {lease['environment_id']}\n"
             f"Task: {lease['task_id']}\n"
             f"Reason: {lease.get('release_reason')}\n"
             f"Status: {lease.get('status')}"
-        )
+        ]
+        if message:
+            lines.append(f"Message: {message}")
+        return "\n".join(lines)
 
     def lease_aware_deploy(self, environment_id: str, task_id: str, actor: str, source_repo_path: str,
                            agent_id: Optional[str] = None, agent_name: Optional[str] = None,
@@ -346,6 +359,8 @@ class LeaseManager:
         env = self._environment(environment_id)
         if not env:
             return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
+        if not os.path.isdir(source_repo_path):
+            return {"ok": False, "error": "source_repo_path_not_found", "source_repo_path": source_repo_path}
         acquire = self.acquire(environment_id, task_id, actor, agent_id, agent_name, branch, commit, {"source_repo_path": source_repo_path})
         if not acquire.get("ok"):
             return acquire
@@ -408,4 +423,3 @@ class LeaseManager:
         deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"served_commit": served_commit, "deploy": deploy_payload})
         deployed["deploy"] = deploy_payload
         return deployed
-

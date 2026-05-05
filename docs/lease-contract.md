@@ -226,6 +226,16 @@ All tools return structured JSON with `ok`.
 }
 ```
 
+Named release tools are available for agents that should not choose arbitrary
+reasons:
+
+- `dev_env_mark_deploy_failed`
+- `dev_env_mark_qa_failed`
+- `dev_env_mark_prod_failed`
+- `dev_env_mark_done`
+
+Each named tool accepts `lease_id`, `actor`, and optional `message`.
+
 ### `dev_env_force_release`
 
 ```json
@@ -270,6 +280,7 @@ Environment: agent-hq-dev
 Task: 426
 Reason: qa_failed
 Status: qa_failed
+Message: Regression failed on dev.
 ```
 
 ## Integrity Rules
@@ -280,4 +291,3 @@ Status: qa_failed
 - A successful dev deploy keeps the environment locked for QA.
 - Deploy failure, QA failure, production failure, cancellation, and done each release with an audited reason.
 - Stale detection is visible to operators. The manager does not silently unlock active QA work unless explicit policy or force action is used.
-

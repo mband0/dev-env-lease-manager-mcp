@@ -117,6 +117,30 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "invalid_release_reason")
 
+    def test_release_reasons_are_bound_to_state_machine(self) -> None:
+        manager, _ = self.make_manager()
+        lease = manager.acquire("agent-hq-dev", "426", "cinder")["lease"]
+
+        result = manager.release(lease["id"], "release", "done")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "invalid_release_transition")
+        self.assertEqual(result["from_status"], "acquired")
+        self.assertEqual(result["release_reason"], "done")
+        self.assertEqual(result["allowed_from"], ["prod_deploying"])
+
+    def test_qa_failed_release_unlocks_after_qa_state(self) -> None:
+        manager, _ = self.make_manager()
+        lease = manager.acquire("agent-hq-dev", "426", "cinder")["lease"]
+        manager.transition(lease["id"], "mark_deploying", "deploy")
+        manager.transition(lease["id"], "mark_deployed_for_qa", "deploy")
+
+        result = manager.release(lease["id"], "qa", "qa_failed", "regression failed")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "qa_failed")
+        self.assertTrue(manager.status()["environments"][0]["available"])
+
     def test_admin_force_release_requires_actor_and_reason(self) -> None:
         manager, _ = self.make_manager()
         lease = manager.acquire("agent-hq-dev", "426", "cinder")["lease"]
@@ -186,4 +210,3 @@ class LeaseManagerTests(ManagerTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

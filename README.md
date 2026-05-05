@@ -25,5 +25,8 @@ python3 -m dev_env_lease_manager.cli release --lease-id <lease> --reason qa_fail
 python3 -m dev_env_lease_manager.cli force-release --environment-id agent-hq-dev --actor operator:nordini --reason stale
 ```
 
-See [docs/lease-contract.md](docs/lease-contract.md) for the contract, state machine, and MCP payloads.
-
+See [docs/lease-contract.md](docs/lease-contract.md) for the contract, state
+machine, and MCP payloads. See
+[docs/deploy-tool-contract.md](docs/deploy-tool-contract.md) for agent deploy
+rules and [docs/agent-hq-registration.md](docs/agent-hq-registration.md) for
+Agent HQ MCP registration.

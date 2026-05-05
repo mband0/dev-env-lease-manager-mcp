@@ -15,6 +15,10 @@ python3 -m dev_env_lease_manager.mcp_server --config config/environments.json
 - `dev_env_mark_deployed_for_qa`
 - `dev_env_mark_prod_deploying`
 - `dev_env_release`
+- `dev_env_mark_deploy_failed`
+- `dev_env_mark_qa_failed`
+- `dev_env_mark_prod_failed`
+- `dev_env_mark_done`
 - `dev_env_force_release`
 - `dev_env_heartbeat`
 - `dev_env_sweep_stale`
@@ -42,6 +46,9 @@ blocked/waiting state and must not mutate the shared checkout manually.
 
 ## Example Release
 
+The generic release tool accepts a `reason`. The named release tools use the
+same payload minus `reason`, and bind the reason to the tool name.
+
 ```json
 {
   "lease_id": "uuid",
@@ -50,4 +57,3 @@ blocked/waiting state and must not mutate the shared checkout manually.
   "message": "QA regression failed."
 }
 ```
-

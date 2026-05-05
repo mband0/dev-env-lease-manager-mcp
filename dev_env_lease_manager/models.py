@@ -29,6 +29,16 @@ RELEASE_REASON_TO_STATUS = {
     "manual_release": "released",
 }
 
+RELEASE_REASON_ALLOWED_FROM = {
+    "deploy_failed": {"deploying", "stale"},
+    "qa_failed": {"deployed_for_qa", "stale"},
+    "prod_failed": {"prod_deploying", "stale"},
+    "done": {"prod_deploying"},
+    "cancelled": ACTIVE_STATUSES,
+    "stale_released": {"stale"},
+    "manual_release": ACTIVE_STATUSES,
+}
+
 ALLOWED_TRANSITIONS = {
     "mark_deploying": ({"acquired"}, "deploying"),
     "mark_deployed_for_qa": ({"deploying"}, "deployed_for_qa"),
@@ -36,4 +46,3 @@ ALLOWED_TRANSITIONS = {
 }
 
 DEFAULT_STALE_AFTER_SECONDS = 2 * 60 * 60
-

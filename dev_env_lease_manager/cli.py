@@ -33,16 +33,27 @@ def build_parser() -> argparse.ArgumentParser:
     acquire.add_argument("--branch")
     acquire.add_argument("--commit")
 
-    for name in ("mark-deploying", "mark-deployed-for-qa", "mark-prod-deploying", "heartbeat"):
+    for name in ("mark-deploying", "mark-prod-deploying", "heartbeat"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--lease-id", required=True)
         cmd.add_argument("--actor", required=True)
+
+    deployed = sub.add_parser("mark-deployed-for-qa")
+    deployed.add_argument("--lease-id", required=True)
+    deployed.add_argument("--actor", required=True)
+    deployed.add_argument("--served-commit")
 
     release = sub.add_parser("release")
     release.add_argument("--lease-id", required=True)
     release.add_argument("--actor", required=True)
     release.add_argument("--reason", required=True)
     release.add_argument("--message")
+
+    for name in ("mark-deploy-failed", "mark-qa-failed", "mark-prod-failed", "mark-done"):
+        cmd = sub.add_parser(name)
+        cmd.add_argument("--lease-id", required=True)
+        cmd.add_argument("--actor", required=True)
+        cmd.add_argument("--message")
 
     force = sub.add_parser("force-release")
     force.add_argument("--actor", required=True)
@@ -92,10 +103,19 @@ def main(argv: list[str] | None = None) -> int:
                 args.agent_name, args.branch, args.commit,
             ),
             "mark-deploying": lambda: manager.transition(args.lease_id, "mark_deploying", args.actor),
-            "mark-deployed-for-qa": lambda: manager.transition(args.lease_id, "mark_deployed_for_qa", args.actor),
+            "mark-deployed-for-qa": lambda: manager.transition(
+                args.lease_id,
+                "mark_deployed_for_qa",
+                args.actor,
+                {"served_commit": args.served_commit},
+            ),
             "mark-prod-deploying": lambda: manager.transition(args.lease_id, "mark_prod_deploying", args.actor),
             "heartbeat": lambda: manager.heartbeat(args.lease_id, args.actor),
             "release": lambda: manager.release(args.lease_id, args.actor, args.reason, args.message),
+            "mark-deploy-failed": lambda: manager.release(args.lease_id, args.actor, "deploy_failed", args.message),
+            "mark-qa-failed": lambda: manager.release(args.lease_id, args.actor, "qa_failed", args.message),
+            "mark-prod-failed": lambda: manager.release(args.lease_id, args.actor, "prod_failed", args.message),
+            "mark-done": lambda: manager.release(args.lease_id, args.actor, "done", args.message),
             "force-release": lambda: manager.force_release(args.actor, args.reason, args.lease_id, args.environment_id),
             "sweep-stale": lambda: manager.sweep_stale(args.actor),
             "events": lambda: manager.events(args.lease_id),
@@ -121,4 +141,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
