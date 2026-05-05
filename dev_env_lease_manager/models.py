@@ -1,0 +1,39 @@
+from __future__ import annotations
+
+ACTIVE_STATUSES = {
+    "acquired",
+    "deploying",
+    "deployed_for_qa",
+    "prod_deploying",
+    "stale",
+}
+
+TERMINAL_STATUSES = {
+    "released",
+    "deploy_failed",
+    "qa_failed",
+    "prod_failed",
+    "done",
+    "cancelled",
+    "stale_released",
+    "force_released",
+}
+
+RELEASE_REASON_TO_STATUS = {
+    "deploy_failed": "deploy_failed",
+    "qa_failed": "qa_failed",
+    "prod_failed": "prod_failed",
+    "done": "done",
+    "cancelled": "cancelled",
+    "stale_released": "stale_released",
+    "manual_release": "released",
+}
+
+ALLOWED_TRANSITIONS = {
+    "mark_deploying": ({"acquired"}, "deploying"),
+    "mark_deployed_for_qa": ({"deploying"}, "deployed_for_qa"),
+    "mark_prod_deploying": ({"deployed_for_qa"}, "prod_deploying"),
+}
+
+DEFAULT_STALE_AFTER_SECONDS = 2 * 60 * 60
+

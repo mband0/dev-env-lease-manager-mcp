@@ -1,0 +1,27 @@
+{
+  "data_path": "~/.dev-environment-lease-manager/state.sqlite3",
+  "default_stale_after_seconds": 7200,
+  "agent_hq": {
+    "base_url": "http://127.0.0.1:3501"
+  },
+  "environments": [
+    {
+      "id": "agent-hq-dev",
+      "label": "Agent HQ Dev",
+      "base_url": "http://127.0.0.1:3510",
+      "health_url": "http://127.0.0.1:3511/health",
+      "repo_path": "/Users/nordini/agent-hq-dev",
+      "deploy_command": "/Users/nordini/agent-hq/scripts/capability-tools/deploy_dev_worktree.sh",
+      "served_commit_command": "git -C /Users/nordini/agent-hq-dev rev-parse HEAD",
+      "stale_after_seconds": 7200,
+      "tags": ["agent-hq", "dev", "shared-checkout"],
+      "metadata": {
+        "api_port": 3511,
+        "ui_port": 3510,
+        "pm2_api": "agent-hq-dev-api",
+        "pm2_ui": "agent-hq-dev-ui"
+      }
+    }
+  ]
+}
+
