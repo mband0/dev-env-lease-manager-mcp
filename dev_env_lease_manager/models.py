@@ -17,6 +17,7 @@ TERMINAL_STATUSES = {
     "cancelled",
     "stale_released",
     "force_released",
+    "superseded",
 }
 
 RELEASE_REASON_TO_STATUS = {
@@ -27,6 +28,7 @@ RELEASE_REASON_TO_STATUS = {
     "cancelled": "cancelled",
     "stale_released": "stale_released",
     "manual_release": "released",
+    "superseded": "superseded",
 }
 
 RELEASE_REASON_ALLOWED_FROM = {
@@ -37,6 +39,7 @@ RELEASE_REASON_ALLOWED_FROM = {
     "cancelled": ACTIVE_STATUSES,
     "stale_released": {"stale"},
     "manual_release": ACTIVE_STATUSES,
+    "superseded": {"deployed_for_qa", "stale"},
 }
 
 ALLOWED_TRANSITIONS = {

@@ -115,7 +115,8 @@ class LeaseManager:
 
     def acquire(self, environment_id: str, task_id: str, actor: str, agent_id: Optional[str] = None,
                 agent_name: Optional[str] = None, branch: Optional[str] = None,
-                commit: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                commit: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+                supersede_same_task_review: bool = False) -> Dict[str, Any]:
         if not task_id:
             return {"ok": False, "error": "task_id is required"}
         if not actor:
@@ -126,12 +127,50 @@ class LeaseManager:
 
         now = utc_now()
         lease_id = str(uuid4())
+        superseded_lease = None
         try:
             self.conn.execute("BEGIN IMMEDIATE")
             active = self._active_lease(environment_id)
             if active:
-                self.conn.execute("ROLLBACK")
-                return self._busy(env, active)
+                can_supersede = (
+                    supersede_same_task_review
+                    and str(active.get("task_id")) == str(task_id)
+                    and active.get("status") in {"deployed_for_qa", "stale"}
+                )
+                if not can_supersede:
+                    self.conn.execute("ROLLBACK")
+                    return self._busy(env, active)
+                message = (
+                    "Superseded by same-task redeploy"
+                    f" for task {task_id}"
+                    f" from commit {active.get('commit_sha') or 'unknown'}"
+                    f" to commit {commit or 'unknown'}"
+                )
+                self.conn.execute(
+                    "UPDATE leases SET status = 'superseded', release_reason = 'superseded', released_at = ?, heartbeat_at = ? WHERE id = ?",
+                    (now, now, active["id"]),
+                )
+                self._event(active["id"], active["environment_id"], active["task_id"], actor, "release", active["status"], "superseded", "superseded", message)
+                self._event(
+                    active["id"],
+                    active["environment_id"],
+                    active["task_id"],
+                    actor,
+                    "supersede_for_redeploy",
+                    active["status"],
+                    "superseded",
+                    "superseded",
+                    message,
+                    {
+                        "superseded_by": {
+                            "task_id": str(task_id),
+                            "actor": actor,
+                            "branch": branch,
+                            "commit": commit,
+                        }
+                    },
+                )
+                superseded_lease = self._lease(active["id"])
             self.conn.execute(
                 """
                 INSERT INTO leases (
@@ -160,7 +199,10 @@ class LeaseManager:
             active = self._active_lease(environment_id)
             return self._busy(env, active or {})
 
-        return {"ok": True, "status": "acquired", "environment": env, "lease": self._lease(lease_id)}
+        result = {"ok": True, "status": "acquired", "environment": env, "lease": self._lease(lease_id)}
+        if superseded_lease:
+            result["superseded_lease"] = superseded_lease
+        return result
 
     def transition(self, lease_id: str, event_type: str, actor: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if event_type not in ALLOWED_TRANSITIONS:
@@ -362,16 +404,33 @@ class LeaseManager:
             return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
         if not os.path.isdir(source_repo_path):
             return {"ok": False, "error": "source_repo_path_not_found", "source_repo_path": source_repo_path}
-        acquire = self.acquire(environment_id, task_id, actor, agent_id, agent_name, branch, commit, {"source_repo_path": source_repo_path})
+        acquire = self.acquire(
+            environment_id,
+            task_id,
+            actor,
+            agent_id,
+            agent_name,
+            branch,
+            commit,
+            {"source_repo_path": source_repo_path},
+            supersede_same_task_review=True,
+        )
+        superseded_lease = acquire.get("superseded_lease")
         if not acquire.get("ok"):
+            if superseded_lease:
+                acquire["superseded_lease"] = superseded_lease
             return acquire
         lease_id = acquire["lease"]["id"]
         deploying = self.transition(lease_id, "mark_deploying", actor)
         if not deploying.get("ok"):
+            if superseded_lease:
+                deploying["superseded_lease"] = superseded_lease
             return deploying
         if dry_run:
             deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"dry_run": True, "served_commit": commit})
             deployed["deploy"] = {"dry_run": True}
+            if superseded_lease:
+                deployed["superseded_lease"] = superseded_lease
             return deployed
 
         metadata = env.get("metadata") or {}
@@ -381,6 +440,8 @@ class LeaseManager:
             if not deploy_payload.get("ok"):
                 released = self.release(lease_id, actor, "deploy_failed", deploy_payload.get("message") or deploy_payload.get("stderr") or "deploy command failed")
                 released["deploy"] = deploy_payload
+                if superseded_lease:
+                    released["superseded_lease"] = superseded_lease
                 return released
         else:
             try:
@@ -396,6 +457,8 @@ class LeaseManager:
                 deploy_payload = exc.payload()
                 released = self.release(lease_id, actor, "deploy_failed", deploy_payload.get("error", "native deploy failed"))
                 released["deploy"] = deploy_payload
+                if superseded_lease:
+                    released["superseded_lease"] = superseded_lease
                 return released
 
         served_commit = commit
@@ -405,14 +468,20 @@ class LeaseManager:
             if served.returncode != 0:
                 released = self.release(lease_id, actor, "deploy_failed", served.stderr[-1000:] or "served commit command failed")
                 released["deploy"] = deploy_payload
+                if superseded_lease:
+                    released["superseded_lease"] = superseded_lease
                 return released
             served_commit = served.stdout.strip()
         if commit and served_commit and commit != served_commit:
             released = self.release(lease_id, actor, "deploy_failed", f"served commit {served_commit} did not match expected {commit}")
             released["deploy"] = deploy_payload
+            if superseded_lease:
+                released["superseded_lease"] = superseded_lease
             return released
         deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"served_commit": served_commit, "deploy": deploy_payload})
         deployed["deploy"] = deploy_payload
+        if superseded_lease:
+            deployed["superseded_lease"] = superseded_lease
         return deployed
 
     def _command_deploy(self, env: Dict[str, Any], lease_id: str, environment_id: str, task_id: str,

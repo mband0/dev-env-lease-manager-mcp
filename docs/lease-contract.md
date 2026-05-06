@@ -97,6 +97,8 @@ deployed_for_qa
     -> prod_deploying
   release(qa_failed)
     -> qa_failed
+  release(superseded)
+    -> superseded
   release(cancelled)
     -> cancelled
   force_release
@@ -113,13 +115,15 @@ prod_deploying
     -> force_released
 
 stale
+  release(superseded)
+    -> superseded
   release(stale_released)
     -> stale_released
   force_release
     -> force_released
 ```
 
-Terminal statuses are `released`, `deploy_failed`, `qa_failed`, `prod_failed`, `done`, `cancelled`, `stale_released`, and `force_released`.
+Terminal statuses are `released`, `deploy_failed`, `qa_failed`, `prod_failed`, `done`, `cancelled`, `stale_released`, `superseded`, and `force_released`.
 
 ## Release Reasons
 
@@ -132,6 +136,14 @@ Allowed normal release reasons:
 - `cancelled`
 - `stale_released`
 - `manual_release`
+- `superseded`
+
+`superseded` is reserved for same-task redeploys. If task X already owns an
+active `deployed_for_qa` or `stale` lease and task X deploys a newer review
+candidate, the lease-aware deploy path releases the prior lease as
+`superseded` before acquiring a fresh lease for the new commit. This keeps the
+old artifact auditable without forcing operator cleanup. Different tasks remain
+blocked by the active lease.
 
 Admin force release requires:
 

@@ -76,6 +76,51 @@ class LeaseWorkflowE2ETests(unittest.TestCase):
         self.assertEqual(prism["owner"]["commit"], "commit-a")
         self.assertIn("Do not deploy", prism["next_action"])
 
+    def test_same_task_redeploy_supersedes_active_review_lease(self) -> None:
+        manager, tmp = self.make_manager()
+        source = self.make_source(tmp)
+
+        first = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "438",
+            "cinder",
+            str(source),
+            agent_id="cinder-backend",
+            agent_name="Cinder",
+            branch="cinder/task-438",
+            commit="old-review-commit",
+            dry_run=True,
+        )
+        second = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "438",
+            "cinder",
+            str(source),
+            agent_id="cinder-backend",
+            agent_name="Cinder",
+            branch="cinder/task-438",
+            commit="follow-up-fix-commit",
+            dry_run=True,
+        )
+
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["status"], "deployed_for_qa")
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["status"], "deployed_for_qa")
+        self.assertEqual(second["superseded_lease"]["id"], first["lease"]["id"])
+        self.assertEqual(second["superseded_lease"]["status"], "superseded")
+        self.assertEqual(second["superseded_lease"]["release_reason"], "superseded")
+        self.assertEqual(second["lease"]["commit_sha"], "follow-up-fix-commit")
+
+        active = manager.status()["environments"][0]["active_lease"]
+        self.assertEqual(active["id"], second["lease"]["id"])
+        self.assertEqual(active["task_id"], "438")
+        self.assertEqual(active["commit_sha"], "follow-up-fix-commit")
+
+        events = manager.events(first["lease"]["id"])["events"]
+        self.assertIn("release", [event["event_type"] for event in events])
+        self.assertIn("supersede_for_redeploy", [event["event_type"] for event in events])
+
     def test_successful_deploy_verifies_served_commit_and_returns_review_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             served = Path(tmp_name) / "served.txt"

@@ -7,6 +7,10 @@ Implementation agents:
 3. If the environment is busy, post blocked/waiting with the lease id and owner details.
 4. Do not manually pull, reset, copy, or mutate the shared dev checkout.
 5. Post review evidence only after the lease reaches `deployed_for_qa`.
+6. If a prior review lease for the same task is still active after QA failure,
+   redeploy through the lease-aware path. The previous same-task review lease is
+   recorded as `superseded`; do not force-release it manually unless the
+   lease-aware deploy reports a real blocker.
 
 QA agents:
 
