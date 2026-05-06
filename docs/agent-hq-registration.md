@@ -9,15 +9,12 @@ Capabilities:
   "slug": "dev-environment-lease-manager",
   "description": "External lease authority for shared Agent HQ development environments.",
   "transport": "stdio",
-  "command": "python3",
+  "command": ".venv/bin/dev-env-lease-mcp",
   "args": [
-    "-B",
-    "-m",
-    "dev_env_lease_manager.mcp_server",
     "--config",
-    "/Users/nordini/dev-environment-lease-manager/config/environments.json"
+    "config/environments.json"
   ],
-  "cwd": "/Users/nordini/dev-environment-lease-manager",
+  "cwd": "<lease-manager-checkout>",
   "env": {},
   "enabled": true
 }

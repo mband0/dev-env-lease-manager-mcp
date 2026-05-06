@@ -2,13 +2,16 @@
 name = "dev-environment-lease-manager"
 version = "0.1.0"
 description = "External MCP server that owns dev environment deployment leases."
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 readme = "README.md"
 license = { text = "UNLICENSED" }
+dependencies = [
+  "mcp>=1.0,<2",
+]
 
 [project.scripts]
 dev-env-lease = "dev_env_lease_manager.cli:main"
+dev-env-lease-mcp = "dev_env_lease_manager.mcp_server:main"
 
 [tool.setuptools]
 packages = ["dev_env_lease_manager"]
-

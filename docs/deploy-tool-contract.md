@@ -13,7 +13,7 @@ Use the MCP tool:
   "environment_id": "agent-hq-dev",
   "task_id": "426",
   "actor": "cinder-backend",
-  "source_repo_path": "/Users/nordini/.openclaw/workspace-cinder/agent-hq",
+  "source_repo_path": "/path/to/agent/worktree",
   "agent_id": "cinder-backend",
   "agent_name": "Cinder",
   "branch": "cinder/task-426",
@@ -26,7 +26,7 @@ Use the MCP tool:
 Equivalent CLI:
 
 ```sh
-python3 -B -m dev_env_lease_manager.cli --config /Users/nordini/dev-environment-lease-manager/config/environments.json deploy agent-hq-dev --task-id 426 --actor cinder-backend --source-repo-path /Users/nordini/.openclaw/workspace-cinder/agent-hq --branch cinder/task-426 --commit abc123
+.venv/bin/dev-env-lease --config config/environments.json deploy agent-hq-dev --task-id 426 --actor cinder-backend --source-repo-path /path/to/agent/worktree --branch cinder/task-426 --commit abc123
 ```
 
 The deploy path acquires a lease, marks it `deploying`, promotes the exact clean

@@ -186,7 +186,7 @@ class NativeDevDeployer:
         if not dev_repo_path:
             raise NativeDeployError("environment repo_path is required for native deploy")
 
-        canonical_root = expand_path(str(metadata.get("canonical_root") or "/Users/nordini/agent-hq"))
+        canonical_root = expand_path(str(metadata.get("canonical_root") or source_repo_path))
         state_dir = expand_path(str(metadata.get("state_dir") or "~/.agent-hq-dev-deploy"))
         state_file = expand_path(str(metadata.get("state_file") or str(Path(state_dir) / "current-target.json")))
         lock_dir = Path(state_dir) / "lock"

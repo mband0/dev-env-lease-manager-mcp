@@ -3,7 +3,7 @@
 The server runs over MCP stdio:
 
 ```sh
-python3 -m dev_env_lease_manager.mcp_server --config config/environments.json
+.venv/bin/dev-env-lease-mcp --config config/environments.json
 ```
 
 ## Tools
