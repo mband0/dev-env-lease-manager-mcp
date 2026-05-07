@@ -79,6 +79,12 @@ class LeaseManager:
     def _lease(self, lease_id: str) -> Optional[Dict[str, Any]]:
         return row_to_dict(self.conn.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone())
 
+    def _callback_url(self, callback_url: Optional[str]) -> Optional[str]:
+        return callback_url or self.config.agent_hq_base_url
+
+    def _callback_api_key(self, callback_api_key: Optional[str]) -> Optional[str]:
+        return callback_api_key or os.environ.get("AGENT_HQ_MCP_API_KEY")
+
     def _queue_row(self, queue_id: str) -> Optional[Dict[str, Any]]:
         return row_to_dict(self.conn.execute("SELECT * FROM deploy_queue WHERE id = ?", (queue_id,)).fetchone())
 
@@ -203,7 +209,7 @@ class LeaseManager:
     def _send_callback(self, queue: Dict[str, Any], event: str, message: str,
                        lease: Optional[Dict[str, Any]] = None,
                        error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        callback_url = queue.get("callback_url")
+        callback_url = self._callback_url(queue.get("callback_url"))
         if not callback_url:
             return {"ok": True, "skipped": True, "reason": "callback_url_not_configured"}
 
@@ -231,7 +237,7 @@ class LeaseManager:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        api_key = queue.get("callback_api_key")
+        api_key = self._callback_api_key(queue.get("callback_api_key"))
         if api_key:
             request.add_header("x-api-key", str(api_key))
 
@@ -385,6 +391,15 @@ class LeaseManager:
 
         now = utc_now()
         queue_id = str(uuid4())
+        resolved_callback_url = self._callback_url(callback_url)
+        resolved_callback_api_key = self._callback_api_key(callback_api_key)
+        if resolved_callback_url and not resolved_callback_api_key:
+            return {
+                "ok": False,
+                "error": "callback_api_key_required",
+                "message": "AGENT_HQ_MCP_API_KEY is required in the lease manager MCP server env when Agent HQ callbacks are configured.",
+                "environment_id": environment_id,
+            }
         superseded: list[Dict[str, Any]] = []
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -433,8 +448,8 @@ class LeaseManager:
                     services,
                     1 if health_check else 0,
                     int(priority),
-                    callback_url,
-                    callback_api_key,
+                    resolved_callback_url,
+                    resolved_callback_api_key,
                     now,
                     now,
                     json.dumps(metadata or {}, sort_keys=True),
@@ -541,7 +556,8 @@ class LeaseManager:
         self._event(lease_id, lease["environment_id"], lease["task_id"], actor, "heartbeat", lease["status"], lease["status"])
         return {"ok": True, "lease": self._lease(lease_id)}
 
-    def release(self, lease_id: str, actor: str, reason: str, message: Optional[str] = None) -> Dict[str, Any]:
+    def release(self, lease_id: str, actor: str, reason: str, message: Optional[str] = None,
+                sweep_queue_after_release: bool = True) -> Dict[str, Any]:
         if reason not in RELEASE_REASON_TO_STATUS:
             return {"ok": False, "error": "invalid_release_reason", "allowed_reasons": sorted(RELEASE_REASON_TO_STATUS)}
         if not actor:
@@ -571,10 +587,17 @@ class LeaseManager:
         )
         self._event(lease_id, lease["environment_id"], lease["task_id"], actor, "release", from_status, to_status, reason, message)
         updated = self._lease(lease_id)
-        return {"ok": True, "status": to_status, "lease": updated, "release_reason": reason, "agent_hq_note": self.release_note(updated, message)}
+        result = {"ok": True, "status": to_status, "lease": updated, "release_reason": reason, "agent_hq_note": self.release_note(updated, message)}
+        if sweep_queue_after_release:
+            try:
+                result["queue_sweep"] = self.sweep_deploy_queue("queue-worker", environment_id=lease["environment_id"], limit=1)
+            except Exception as exc:
+                result["queue_sweep"] = {"ok": False, "error": "queue_sweep_failed", "message": str(exc)}
+        return result
 
     def force_release(self, actor: str, reason: str, lease_id: Optional[str] = None,
-                      environment_id: Optional[str] = None) -> Dict[str, Any]:
+                      environment_id: Optional[str] = None,
+                      sweep_queue_after_release: bool = True) -> Dict[str, Any]:
         if not actor:
             return {"ok": False, "error": "actor is required"}
         if not reason:
@@ -589,7 +612,13 @@ class LeaseManager:
             (reason, now, now, lease["id"]),
         )
         self._event(lease["id"], lease["environment_id"], lease["task_id"], actor, "force_release", from_status, "force_released", reason)
-        return {"ok": True, "status": "force_released", "lease": self._lease(lease["id"]), "release_reason": reason}
+        result = {"ok": True, "status": "force_released", "lease": self._lease(lease["id"]), "release_reason": reason}
+        if sweep_queue_after_release:
+            try:
+                result["queue_sweep"] = self.sweep_deploy_queue("queue-worker", environment_id=lease["environment_id"], limit=1)
+            except Exception as exc:
+                result["queue_sweep"] = {"ok": False, "error": "queue_sweep_failed", "message": str(exc)}
+        return result
 
     def status(self, environment_id: Optional[str] = None, include_events: bool = False) -> Dict[str, Any]:
         params: Iterable[Any] = (environment_id,) if environment_id else ()
@@ -707,7 +736,13 @@ class LeaseManager:
         if deploy_mode == "command":
             deploy_payload = self._command_deploy(env, lease_id, environment_id, task_id, actor, source_repo_path, commit, services, health_check, timeout_seconds)
             if not deploy_payload.get("ok"):
-                released = self.release(lease_id, actor, "deploy_failed", deploy_payload.get("message") or deploy_payload.get("stderr") or "deploy command failed")
+                released = self.release(
+                    lease_id,
+                    actor,
+                    "deploy_failed",
+                    deploy_payload.get("message") or deploy_payload.get("stderr") or "deploy command failed",
+                    sweep_queue_after_release=False,
+                )
                 released["deploy"] = deploy_payload
                 return released
         else:
@@ -722,7 +757,13 @@ class LeaseManager:
                 )
             except NativeDeployError as exc:
                 deploy_payload = exc.payload()
-                released = self.release(lease_id, actor, "deploy_failed", deploy_payload.get("error", "native deploy failed"))
+                released = self.release(
+                    lease_id,
+                    actor,
+                    "deploy_failed",
+                    deploy_payload.get("error", "native deploy failed"),
+                    sweep_queue_after_release=False,
+                )
                 released["deploy"] = deploy_payload
                 return released
 
@@ -731,12 +772,24 @@ class LeaseManager:
         if served_cmd:
             served = subprocess.run(served_cmd, shell=True, text=True, capture_output=True, timeout=60)
             if served.returncode != 0:
-                released = self.release(lease_id, actor, "deploy_failed", served.stderr[-1000:] or "served commit command failed")
+                released = self.release(
+                    lease_id,
+                    actor,
+                    "deploy_failed",
+                    served.stderr[-1000:] or "served commit command failed",
+                    sweep_queue_after_release=False,
+                )
                 released["deploy"] = deploy_payload
                 return released
             served_commit = served.stdout.strip()
         if commit and served_commit and commit != served_commit:
-            released = self.release(lease_id, actor, "deploy_failed", f"served commit {served_commit} did not match expected {commit}")
+            released = self.release(
+                lease_id,
+                actor,
+                "deploy_failed",
+                f"served commit {served_commit} did not match expected {commit}",
+                sweep_queue_after_release=False,
+            )
             released["deploy"] = deploy_payload
             return released
         deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"served_commit": served_commit, "deploy": deploy_payload})

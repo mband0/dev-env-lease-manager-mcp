@@ -54,6 +54,17 @@ state, not a blocked task state. The queue worker command/tool
 commit once the environment is available. New queued requests for the same task
 supersede older queued requests so stale commits do not deploy later.
 
+Normal lease release also sweeps the next queued deploy for that environment.
+Callers may still run `sweep-deploy-queue` manually for recovery or operator
+maintenance, but the expected path is that releasing the active lease promotes
+the next queued request automatically.
+
+Queued callbacks use the explicit `callback_url` / `callback_api_key` when
+provided. If omitted, the manager falls back to `agent_hq.base_url` for the
+callback URL. The callback API key must come from the calling agent's
+materialized MCP environment as `AGENT_HQ_MCP_API_KEY`, or from an explicit
+`callback_api_key` argument. A shared lease-manager service key is not required.
+
 When callback settings are supplied, the lease manager posts Agent HQ external
 task events for `dev_deploy_queued`, `dev_deploying`, `deployed_for_qa`,
 `deploy_failed`, `cancelled`, and `superseded`.

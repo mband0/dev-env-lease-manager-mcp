@@ -15,11 +15,13 @@ from dev_env_lease_manager.manager import LeaseManager
 class ManagerTestCase(unittest.TestCase):
     def make_manager(self, stale_after_seconds: int = 3600, deploy_command: str | None = None,
                      served_commit_command: str | None = None,
-                     metadata: dict[str, object] | None = None) -> tuple[LeaseManager, tempfile.TemporaryDirectory[str]]:
+                     metadata: dict[str, object] | None = None,
+                     agent_hq: dict[str, object] | None = None) -> tuple[LeaseManager, tempfile.TemporaryDirectory[str]]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         payload = {
             "data_path": str(Path(tmp.name) / "state.sqlite3"),
+            "agent_hq": agent_hq or {},
             "environments": [
                 {
                     "id": "agent-hq-dev",
@@ -241,7 +243,7 @@ class LeaseManagerTests(ManagerTestCase):
             dry_run=True,
             queue_if_busy=True,
         )["queue"]
-        manager.force_release("operator", "free queue", lease_id=active["id"])
+        manager.force_release("operator", "free queue", lease_id=active["id"], sweep_queue_after_release=False)
 
         result = manager.sweep_deploy_queue("queue-worker", dry_run=True)
 
@@ -254,6 +256,63 @@ class LeaseManagerTests(ManagerTestCase):
         lease = manager.status()["environments"][0]["active_lease"]
         self.assertEqual(lease["task_id"], "426")
         self.assertEqual(lease["commit_sha"], "queued-commit")
+
+    def test_release_sweeps_next_queued_request(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        active = manager.acquire("agent-hq-dev", "425", "anchor", commit="active")["lease"]
+        queued = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "426",
+            "cinder",
+            str(source),
+            branch="task-426",
+            commit="queued-commit",
+            queue_if_busy=True,
+        )["queue"]
+
+        with patch("dev_env_lease_manager.manager.NativeDevDeployer") as deployer_class:
+            deployer_class.return_value.deploy.return_value = {
+                "ok": True,
+                "mode": "native",
+                "source_sha": "queued-commit",
+            }
+            result = manager.release(active["id"], "anchor", "manual_release")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["queue_sweep"]["processed"][0]["queue"]["id"], queued["id"])
+        self.assertEqual(result["queue_sweep"]["processed"][0]["queue"]["status"], "deployed")
+        lease = manager.status()["environments"][0]["active_lease"]
+        self.assertEqual(lease["task_id"], "426")
+        self.assertEqual(lease["commit_sha"], "queued-commit")
+
+    def test_force_release_sweeps_next_queued_request(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        active = manager.acquire("agent-hq-dev", "425", "anchor", commit="active")["lease"]
+        queued = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "426",
+            "cinder",
+            str(source),
+            branch="task-426",
+            commit="queued-commit",
+            queue_if_busy=True,
+        )["queue"]
+
+        with patch("dev_env_lease_manager.manager.NativeDevDeployer") as deployer_class:
+            deployer_class.return_value.deploy.return_value = {
+                "ok": True,
+                "mode": "native",
+                "source_sha": "queued-commit",
+            }
+            result = manager.force_release("operator", "free queue", lease_id=active["id"])
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["queue_sweep"]["processed"][0]["queue"]["id"], queued["id"])
+        self.assertEqual(manager.status()["environments"][0]["active_lease"]["task_id"], "426")
 
     def test_queue_callbacks_include_agent_hq_event_payloads(self) -> None:
         manager, tmp = self.make_manager()
@@ -293,7 +352,7 @@ class LeaseManagerTests(ManagerTestCase):
                 callback_url="http://agent-hq.local",
                 callback_api_key="test-key",
             )["queue"]
-            manager.force_release("operator", "free queue", lease_id=active["id"])
+            manager.force_release("operator", "free queue", lease_id=active["id"], sweep_queue_after_release=False)
             manager.sweep_deploy_queue("queue-worker", dry_run=True)
 
         self.assertEqual([event["event"] for event in captured_events], [
@@ -308,6 +367,75 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertEqual(captured_events[-1]["commit_sha"], "queued-commit")
         self.assertEqual(captured_events[-1]["review_url"], "http://127.0.0.1:3510")
         self.assertEqual(captured_headers[0]["x-api-key"], "test-key")
+
+    def test_queue_callbacks_default_to_agent_hq_config_and_agent_env_key(self) -> None:
+        manager, tmp = self.make_manager(agent_hq={
+            "base_url": "http://agent-hq.local",
+        })
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        manager.acquire("agent-hq-dev", "425", "anchor", commit="active")
+        captured_events: list[dict[str, object]] = []
+        captured_urls: list[str] = []
+        captured_headers: list[dict[str, str]] = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok":true}'
+
+        def fake_urlopen(request, timeout=15):
+            captured_events.append(json.loads(request.data.decode("utf-8")))
+            captured_urls.append(request.full_url)
+            captured_headers.append({key.lower(): value for key, value in request.header_items()})
+            return Response()
+
+        with patch.dict("os.environ", {"AGENT_HQ_MCP_API_KEY": "agent-key"}), \
+             patch("dev_env_lease_manager.manager.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = manager.lease_aware_deploy(
+                "agent-hq-dev",
+                "426",
+                "cinder",
+                str(source),
+                branch="task-426",
+                commit="queued-commit",
+                queue_if_busy=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["queue"]["callback_url"], "http://agent-hq.local")
+        self.assertEqual(captured_events[0]["event"], "dev_deploy_queued")
+        self.assertEqual(captured_urls[0], "http://agent-hq.local/api/v1/external/task-events")
+        self.assertEqual(captured_headers[0]["x-api-key"], "agent-key")
+
+    def test_queue_requires_agent_api_key_when_callbacks_are_configured(self) -> None:
+        manager, tmp = self.make_manager(agent_hq={
+            "base_url": "http://agent-hq.local",
+        })
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        manager.acquire("agent-hq-dev", "425", "anchor", commit="active")
+
+        with patch.dict("os.environ", {}, clear=True):
+            result = manager.lease_aware_deploy(
+                "agent-hq-dev",
+                "426",
+                "cinder",
+                str(source),
+                branch="task-426",
+                commit="queued-commit",
+                queue_if_busy=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "callback_api_key_required")
 
     def test_newer_same_task_queue_request_supersedes_existing_queued_request(self) -> None:
         manager, tmp = self.make_manager()

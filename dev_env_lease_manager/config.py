@@ -90,4 +90,3 @@ def default_config_path() -> str:
         "DEV_ENV_LEASE_CONFIG",
         str(Path(__file__).resolve().parents[1] / "config" / "environments.json"),
     )
-
