@@ -69,6 +69,10 @@ When callback settings are supplied, the lease manager posts Agent HQ external
 task events for `dev_deploy_queued`, `dev_deploying`, `deployed_for_qa`,
 `deploy_failed`, `cancelled`, and `superseded`.
 
+Every callback attempt is recorded in the lease manager state database without
+storing the API key. Operators can inspect delivery with `callback-attempts` or
+the `dev_env_callback_attempts` MCP tool.
+
 If no matching environment exists, the agent posts blocked/waiting with
 `environment_not_found`. The agent must not invent a new target or deploy to
 production.

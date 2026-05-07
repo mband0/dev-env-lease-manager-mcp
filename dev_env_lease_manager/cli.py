@@ -82,6 +82,13 @@ def build_parser() -> argparse.ArgumentParser:
     events = sub.add_parser("events")
     events.add_argument("--lease-id", required=True)
 
+    callback_attempts = sub.add_parser("callback-attempts")
+    callback_attempts.add_argument("--queue-id")
+    callback_attempts.add_argument("--lease-id")
+    callback_attempts.add_argument("--task-id")
+    callback_attempts.add_argument("--environment-id")
+    callback_attempts.add_argument("--limit", type=int, default=50)
+
     qa = sub.add_parser("validate-qa")
     qa.add_argument("--task-id", required=True)
     qa.add_argument("--commit", required=True)
@@ -146,6 +153,13 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "cancel-queue": lambda: manager.cancel_queue_request(args.queue_id, args.actor, args.message),
             "events": lambda: manager.events(args.lease_id),
+            "callback-attempts": lambda: manager.callback_attempts(
+                args.queue_id,
+                args.lease_id,
+                args.task_id,
+                args.environment_id,
+                args.limit,
+            ),
             "validate-qa": lambda: manager.validate_qa(args.task_id, args.commit, args.environment_id, args.lease_id),
             "deploy": lambda: manager.lease_aware_deploy(
                 args.environment_id,

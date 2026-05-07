@@ -27,6 +27,7 @@ The server runs over MCP stdio:
 - `dev_env_cancel_queue`
 - `dev_env_validate_qa`
 - `dev_env_events`
+- `dev_env_callback_attempts`
 - `dev_env_deploy_worktree`
 
 `dev_env_deploy_worktree` is the normal dev promotion tool. For environments
@@ -50,9 +51,14 @@ available environment.
 Queued deploys can call Agent HQ's external task event endpoint. Provide
 `callback_url` as either the Agent HQ base URL or
 `/api/v1/external/task-events`, and `callback_api_key` as an Agent HQ MCP API
-key for the `dev_environment_lease_manager` service agent or Atlas. Callback
-events are `dev_deploy_queued`, `dev_deploying`, `deployed_for_qa`,
-`deploy_failed`, `cancelled`, and `superseded`.
+key from the calling agent's materialized MCP environment. Callback events are
+`dev_deploy_queued`, `dev_deploying`, `deployed_for_qa`, `deploy_failed`,
+`cancelled`, and `superseded`.
+
+Each callback attempt is stored durably without the API key. Use
+`dev_env_callback_attempts` with `queue_id`, `lease_id`, `task_id`, or
+`environment_id` to inspect the attempted endpoint, auth presence, HTTP status,
+response body, error, and payload.
 
 ## Example Acquire
 

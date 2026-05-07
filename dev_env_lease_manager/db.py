@@ -93,6 +93,25 @@ def init_schema(conn: sqlite3.Connection) -> None:
       metadata_json TEXT NOT NULL DEFAULT '{}'
     );
 
+    CREATE TABLE IF NOT EXISTS callback_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      queue_id TEXT,
+      lease_id TEXT,
+      environment_id TEXT NOT NULL,
+      task_id TEXT,
+      event TEXT NOT NULL,
+      callback_url TEXT,
+      endpoint TEXT,
+      auth_present INTEGER NOT NULL DEFAULT 0,
+      ok INTEGER NOT NULL DEFAULT 0,
+      outcome TEXT NOT NULL,
+      http_status INTEGER,
+      response_body TEXT,
+      error TEXT,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_active_environment_lease
       ON leases(environment_id)
       WHERE released_at IS NULL
@@ -104,6 +123,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
       ON deploy_queue(environment_id, status, priority DESC, requested_at ASC);
     CREATE INDEX IF NOT EXISTS idx_deploy_queue_task
       ON deploy_queue(environment_id, task_id, status);
+    CREATE INDEX IF NOT EXISTS idx_callback_attempts_queue
+      ON callback_attempts(queue_id, id);
+    CREATE INDEX IF NOT EXISTS idx_callback_attempts_lease
+      ON callback_attempts(lease_id, id);
+    CREATE INDEX IF NOT EXISTS idx_callback_attempts_task
+      ON callback_attempts(environment_id, task_id, id);
     """)
 
 

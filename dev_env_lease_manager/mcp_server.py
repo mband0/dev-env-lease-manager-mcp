@@ -78,6 +78,13 @@ class LeaseManagerMcpTools:
                 a.get("lease_id"),
             ),
             "dev_env_events": lambda a: self.manager.events(a["lease_id"]),
+            "dev_env_callback_attempts": lambda a: self.manager.callback_attempts(
+                a.get("queue_id"),
+                a.get("lease_id"),
+                a.get("task_id"),
+                a.get("environment_id"),
+                int(a.get("limit") or 50),
+            ),
             "dev_env_deploy_worktree": lambda a: self.manager.lease_aware_deploy(
                 a["environment_id"],
                 a["task_id"],
@@ -315,6 +322,23 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
     def dev_env_events(lease_id: str) -> Dict[str, Any]:
         """Return event history for a lease."""
         return service.call_tool("dev_env_events", {"lease_id": lease_id})
+
+    @mcp.tool()
+    def dev_env_callback_attempts(
+        queue_id: Optional[str] = None,
+        lease_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        environment_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Return Agent HQ callback attempt logs."""
+        return service.call_tool("dev_env_callback_attempts", {
+            "queue_id": queue_id,
+            "lease_id": lease_id,
+            "task_id": task_id,
+            "environment_id": environment_id,
+            "limit": limit,
+        })
 
     @mcp.tool()
     def dev_env_deploy_worktree(

@@ -368,6 +368,58 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertEqual(captured_events[-1]["review_url"], "http://127.0.0.1:3510")
         self.assertEqual(captured_headers[0]["x-api-key"], "test-key")
 
+        attempts = list(reversed(manager.callback_attempts(queue_id=queued["id"], limit=10)["callback_attempts"]))
+        self.assertEqual([attempt["event"] for attempt in attempts], [
+            "dev_deploy_queued",
+            "dev_deploying",
+            "deployed_for_qa",
+        ])
+        self.assertTrue(all(attempt["ok"] for attempt in attempts))
+        self.assertTrue(all(attempt["auth_present"] for attempt in attempts))
+        self.assertEqual(attempts[-1]["http_status"], 200)
+        self.assertEqual(attempts[-1]["payload"]["event"], "deployed_for_qa")
+        self.assertNotIn("callback_api_key", attempts[-1])
+        self.assertNotIn("test-key", json.dumps(attempts))
+
+    def test_callback_attempt_logs_http_failure(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        manager.acquire("agent-hq-dev", "425", "anchor", commit="active")
+
+        class Response:
+            status = 503
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok":false,"error":"down"}'
+
+        with patch("dev_env_lease_manager.manager.urllib.request.urlopen", return_value=Response()):
+            result = manager.lease_aware_deploy(
+                "agent-hq-dev",
+                "426",
+                "cinder",
+                str(source),
+                branch="task-426",
+                commit="queued-commit",
+                queue_if_busy=True,
+                callback_url="http://agent-hq.local",
+                callback_api_key="test-key",
+            )
+
+        self.assertTrue(result["ok"])
+        attempt = manager.callback_attempts(queue_id=result["queue"]["id"])["callback_attempts"][0]
+        self.assertFalse(attempt["ok"])
+        self.assertEqual(attempt["outcome"], "http_failure")
+        self.assertEqual(attempt["http_status"], 503)
+        self.assertEqual(attempt["endpoint"], "http://agent-hq.local/api/v1/external/task-events")
+        self.assertEqual(attempt["response_body"], '{"ok":false,"error":"down"}')
+
     def test_queue_callbacks_default_to_agent_hq_config_and_agent_env_key(self) -> None:
         manager, tmp = self.make_manager(agent_hq={
             "base_url": "http://agent-hq.local",

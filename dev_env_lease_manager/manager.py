@@ -181,6 +181,82 @@ class LeaseManager:
             ),
         )
 
+    def _record_callback_attempt(self, *, queue: Dict[str, Any], event: str,
+                                 lease_id: Optional[str], callback_url: Optional[str],
+                                 endpoint: Optional[str], auth_present: bool, ok: bool,
+                                 outcome: str, http_status: Optional[int] = None,
+                                 response_body: Optional[str] = None,
+                                 error: Optional[str] = None,
+                                 payload: Optional[Dict[str, Any]] = None) -> int:
+        cursor = self.conn.execute(
+            """
+            INSERT INTO callback_attempts (
+              queue_id, lease_id, environment_id, task_id, event, callback_url,
+              endpoint, auth_present, ok, outcome, http_status, response_body,
+              error, payload_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                queue.get("id"),
+                lease_id,
+                str(queue.get("environment_id")),
+                queue.get("task_id"),
+                event,
+                callback_url,
+                endpoint,
+                1 if auth_present else 0,
+                1 if ok else 0,
+                outcome,
+                http_status,
+                response_body[-4000:] if response_body else None,
+                error,
+                json.dumps(payload or {}, sort_keys=True),
+                utc_now(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def callback_attempts(self, queue_id: Optional[str] = None, lease_id: Optional[str] = None,
+                          task_id: Optional[str] = None, environment_id: Optional[str] = None,
+                          limit: int = 50) -> Dict[str, Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if queue_id:
+            clauses.append("queue_id = ?")
+            params.append(queue_id)
+        if lease_id:
+            clauses.append("lease_id = ?")
+            params.append(lease_id)
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if environment_id:
+            clauses.append("environment_id = ?")
+            params.append(environment_id)
+
+        bounded_limit = max(1, min(int(limit), 200))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM callback_attempts
+            {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*params, bounded_limit),
+        ).fetchall()
+        attempts = []
+        for row in rows:
+            attempt = row_to_dict(row)
+            if not attempt:
+                continue
+            attempt["ok"] = bool(attempt.get("ok"))
+            attempt["auth_present"] = bool(attempt.get("auth_present"))
+            attempts.append(attempt)
+        return {"ok": True, "callback_attempts": attempts}
+
     def _busy(self, env: Dict[str, Any], lease: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ok": False,
@@ -210,9 +286,6 @@ class LeaseManager:
                        lease: Optional[Dict[str, Any]] = None,
                        error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         callback_url = self._callback_url(queue.get("callback_url"))
-        if not callback_url:
-            return {"ok": True, "skipped": True, "reason": "callback_url_not_configured"}
-
         env = self._environment(str(queue["environment_id"])) or {}
         lease_id = (lease or {}).get("id") or queue.get("lease_id") or queue["id"]
         payload: Dict[str, Any] = {
@@ -230,36 +303,99 @@ class LeaseManager:
         if error:
             payload["error"] = error
 
+        if not callback_url:
+            attempt_id = self._record_callback_attempt(
+                queue=queue,
+                event=event,
+                lease_id=str(lease_id) if lease_id else None,
+                callback_url=None,
+                endpoint=None,
+                auth_present=False,
+                ok=True,
+                outcome="skipped",
+                error="callback_url_not_configured",
+                payload=payload,
+            )
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "callback_url_not_configured",
+                "attempt_id": attempt_id,
+            }
+
+        endpoint = self._callback_endpoint(str(callback_url))
         body = json.dumps(payload, sort_keys=True).encode("utf-8")
         request = urllib.request.Request(
-            self._callback_endpoint(str(callback_url)),
+            endpoint,
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         api_key = self._callback_api_key(queue.get("callback_api_key"))
+        auth_present = bool(api_key)
         if api_key:
             request.add_header("x-api-key", str(api_key))
 
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 response_body = response.read().decode("utf-8", errors="replace")
+                ok = 200 <= response.status < 300
+                attempt_id = self._record_callback_attempt(
+                    queue=queue,
+                    event=event,
+                    lease_id=str(lease_id) if lease_id else None,
+                    callback_url=str(callback_url),
+                    endpoint=endpoint,
+                    auth_present=auth_present,
+                    ok=ok,
+                    outcome="http_success" if ok else "http_failure",
+                    http_status=response.status,
+                    response_body=response_body,
+                    payload=payload,
+                )
                 return {
-                    "ok": 200 <= response.status < 300,
+                    "ok": ok,
                     "status": response.status,
                     "body": response_body[-4000:],
                     "payload": payload,
+                    "attempt_id": attempt_id,
                 }
         except urllib.error.HTTPError as exc:
             response_body = exc.read().decode("utf-8", errors="replace")
+            attempt_id = self._record_callback_attempt(
+                queue=queue,
+                event=event,
+                lease_id=str(lease_id) if lease_id else None,
+                callback_url=str(callback_url),
+                endpoint=endpoint,
+                auth_present=auth_present,
+                ok=False,
+                outcome="http_failure",
+                http_status=exc.code,
+                response_body=response_body,
+                payload=payload,
+            )
             return {
                 "ok": False,
                 "status": exc.code,
                 "body": response_body[-4000:],
                 "payload": payload,
+                "attempt_id": attempt_id,
             }
         except Exception as exc:
-            return {"ok": False, "error": str(exc), "payload": payload}
+            attempt_id = self._record_callback_attempt(
+                queue=queue,
+                event=event,
+                lease_id=str(lease_id) if lease_id else None,
+                callback_url=str(callback_url),
+                endpoint=endpoint,
+                auth_present=auth_present,
+                ok=False,
+                outcome="transport_error",
+                error=str(exc),
+                payload=payload,
+            )
+            return {"ok": False, "error": str(exc), "payload": payload, "attempt_id": attempt_id}
 
     def _set_queue_status(self, queue_id: str, status: str, *,
                           lease_id: Optional[str] = None,
