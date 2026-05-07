@@ -57,6 +57,32 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(payload["status"], "qa_failed")
         self.assertEqual(payload["release_reason"], "qa_failed")
 
+    def test_queue_tools_expose_status_and_cancel(self) -> None:
+        service, manager, tmp = self.make_service()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        manager.acquire("agent-hq-dev", "425", "anchor")
+        queued = service.call_tool("dev_env_deploy_worktree", {
+            "environment_id": "agent-hq-dev",
+            "task_id": "426",
+            "actor": "cinder",
+            "source_repo_path": str(source),
+            "queue_if_busy": True,
+        })["queue"]
+
+        status = service.call_tool("dev_env_queue_status", {"environment_id": "agent-hq-dev"})
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["queue"][0]["id"], queued["id"])
+        self.assertEqual(status["queue"][0]["position"], 1)
+
+        cancelled = service.call_tool("dev_env_cancel_queue", {
+            "queue_id": queued["id"],
+            "actor": "operator",
+            "message": "not needed",
+        })
+        self.assertTrue(cancelled["ok"])
+        self.assertEqual(cancelled["status"], "cancelled")
+
 
 if __name__ == "__main__":
     unittest.main()

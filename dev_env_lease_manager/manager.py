@@ -7,12 +7,24 @@ import shlex
 import sqlite3
 import subprocess
 from typing import Any, Dict, Iterable, Optional
+import urllib.error
+import urllib.request
 from uuid import uuid4
 
 from .config import LeaseManagerConfig
 from .db import connect, sync_environments
 from .deploy import NativeDeployError, NativeDevDeployer
-from .models import ACTIVE_STATUSES, ALLOWED_TRANSITIONS, RELEASE_REASON_ALLOWED_FROM, RELEASE_REASON_TO_STATUS
+from .models import (
+    ACTIVE_STATUSES,
+    ALLOWED_TRANSITIONS,
+    QUEUE_ACTIVE_STATUSES,
+    QUEUE_TERMINAL_STATUSES,
+    RELEASE_REASON_ALLOWED_FROM,
+    RELEASE_REASON_TO_STATUS,
+)
+
+
+CALLBACK_SOURCE = "dev_environment_lease_manager"
 
 
 def utc_now() -> str:
@@ -27,7 +39,7 @@ def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
     if row is None:
         return None
     data = dict(row)
-    for key in ("tags_json", "metadata_json", "payload_json"):
+    for key in ("tags_json", "metadata_json", "payload_json", "error_json"):
         if key in data:
             out_key = key[:-5] if key.endswith("_json") else key
             try:
@@ -66,6 +78,75 @@ class LeaseManager:
 
     def _lease(self, lease_id: str) -> Optional[Dict[str, Any]]:
         return row_to_dict(self.conn.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone())
+
+    def _queue_row(self, queue_id: str) -> Optional[Dict[str, Any]]:
+        return row_to_dict(self.conn.execute("SELECT * FROM deploy_queue WHERE id = ?", (queue_id,)).fetchone())
+
+    def _public_queue(self, queue: Dict[str, Any]) -> Dict[str, Any]:
+        public = dict(queue)
+        public.pop("callback_api_key", None)
+        return public
+
+    def _queue_position(self, queue_id: str) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT environment_id, priority, requested_at FROM deploy_queue WHERE id = ? AND status = 'queued'",
+            (queue_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        ahead = self.conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM deploy_queue
+            WHERE environment_id = ?
+              AND status = 'queued'
+              AND (
+                priority > ?
+                OR (priority = ? AND requested_at < ?)
+                OR (priority = ? AND requested_at = ? AND id < ?)
+              )
+            """,
+            (
+                row["environment_id"],
+                row["priority"],
+                row["priority"],
+                row["requested_at"],
+                row["priority"],
+                row["requested_at"],
+                queue_id,
+            ),
+        ).fetchone()
+        return int(ahead["count"]) + 1
+
+    def _queue_entries(self, environment_id: Optional[str] = None,
+                       include_terminal: bool = False) -> list[Dict[str, Any]]:
+        statuses = set(QUEUE_ACTIVE_STATUSES)
+        if include_terminal:
+            statuses.update(QUEUE_TERMINAL_STATUSES)
+        placeholders = ",".join("?" for _ in statuses)
+        params: list[Any] = sorted(statuses)
+        where = f"status IN ({placeholders})"
+        if environment_id:
+            where = f"environment_id = ? AND {where}"
+            params.insert(0, environment_id)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM deploy_queue
+            WHERE {where}
+            ORDER BY
+              CASE status WHEN 'deploying' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
+              priority DESC,
+              requested_at ASC,
+              id ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        entries = [row_to_dict(row) for row in rows]
+        output = [entry for entry in entries if entry]
+        for entry in output:
+            entry["position"] = self._queue_position(entry["id"])
+        return [self._public_queue(entry) for entry in output]
 
     def _event(self, lease_id: Optional[str], environment_id: str, task_id: Optional[str], actor: str,
                event_type: str, from_status: Optional[str], to_status: Optional[str],
@@ -112,6 +193,87 @@ class LeaseManager:
             },
             "next_action": "Do not deploy or mutate the shared dev checkout. Post blocked/waiting with this lease id, or ask an operator to force release if the lease is stale.",
         }
+
+    def _callback_endpoint(self, callback_url: str) -> str:
+        normalized = callback_url.rstrip("/")
+        if normalized.endswith("/api/v1/external/task-events"):
+            return normalized
+        return f"{normalized}/api/v1/external/task-events"
+
+    def _send_callback(self, queue: Dict[str, Any], event: str, message: str,
+                       lease: Optional[Dict[str, Any]] = None,
+                       error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        callback_url = queue.get("callback_url")
+        if not callback_url:
+            return {"ok": True, "skipped": True, "reason": "callback_url_not_configured"}
+
+        env = self._environment(str(queue["environment_id"])) or {}
+        lease_id = (lease or {}).get("id") or queue.get("lease_id") or queue["id"]
+        payload: Dict[str, Any] = {
+            "source": CALLBACK_SOURCE,
+            "event": event,
+            "task_id": queue["task_id"],
+            "environment_id": queue["environment_id"],
+            "queue_id": queue["id"],
+            "lease_id": lease_id,
+            "branch": queue.get("branch"),
+            "commit_sha": queue.get("commit_sha"),
+            "review_url": env.get("base_url"),
+            "message": message,
+        }
+        if error:
+            payload["error"] = error
+
+        body = json.dumps(payload, sort_keys=True).encode("utf-8")
+        request = urllib.request.Request(
+            self._callback_endpoint(str(callback_url)),
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        api_key = queue.get("callback_api_key")
+        if api_key:
+            request.add_header("x-api-key", str(api_key))
+
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                response_body = response.read().decode("utf-8", errors="replace")
+                return {
+                    "ok": 200 <= response.status < 300,
+                    "status": response.status,
+                    "body": response_body[-4000:],
+                    "payload": payload,
+                }
+        except urllib.error.HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace")
+            return {
+                "ok": False,
+                "status": exc.code,
+                "body": response_body[-4000:],
+                "payload": payload,
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "payload": payload}
+
+    def _set_queue_status(self, queue_id: str, status: str, *,
+                          lease_id: Optional[str] = None,
+                          error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        now = utc_now()
+        fields: Dict[str, Any] = {
+            "status": status,
+            "updated_at": now,
+        }
+        if status == "deploying":
+            fields["started_at"] = now
+        if status in QUEUE_TERMINAL_STATUSES:
+            fields["completed_at"] = now
+        if lease_id is not None:
+            fields["lease_id"] = lease_id
+        if error is not None:
+            fields["error_json"] = json.dumps(error, sort_keys=True)
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        self.conn.execute(f"UPDATE deploy_queue SET {assignments} WHERE id = ?", (*fields.values(), queue_id))
+        return self._queue_row(queue_id) or {"id": queue_id, "status": status}
 
     def acquire(self, environment_id: str, task_id: str, actor: str, agent_id: Optional[str] = None,
                 agent_name: Optional[str] = None, branch: Optional[str] = None,
@@ -203,6 +365,135 @@ class LeaseManager:
         if superseded_lease:
             result["superseded_lease"] = superseded_lease
         return result
+
+    def enqueue_deploy_request(self, environment_id: str, task_id: str, actor: str, source_repo_path: str,
+                               agent_id: Optional[str] = None, agent_name: Optional[str] = None,
+                               branch: Optional[str] = None, commit: Optional[str] = None,
+                               services: str = "both", health_check: bool = True,
+                               priority: int = 0, callback_url: Optional[str] = None,
+                               callback_api_key: Optional[str] = None,
+                               metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if not task_id:
+            return {"ok": False, "error": "task_id is required"}
+        if not actor:
+            return {"ok": False, "error": "actor is required"}
+        env = self._environment(environment_id)
+        if not env:
+            return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
+        if not os.path.isdir(source_repo_path):
+            return {"ok": False, "error": "source_repo_path_not_found", "source_repo_path": source_repo_path}
+
+        now = utc_now()
+        queue_id = str(uuid4())
+        superseded: list[Dict[str, Any]] = []
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing_rows = self.conn.execute(
+                """
+                SELECT *
+                FROM deploy_queue
+                WHERE environment_id = ?
+                  AND task_id = ?
+                  AND status = 'queued'
+                ORDER BY requested_at ASC
+                """,
+                (environment_id, str(task_id)),
+            ).fetchall()
+            for row in existing_rows:
+                old = row_to_dict(row)
+                if not old:
+                    continue
+                self._set_queue_status(old["id"], "superseded", error={
+                    "reason": "newer_request_for_same_task",
+                    "superseded_by": queue_id,
+                    "commit_sha": commit,
+                })
+                superseded.append(self._queue_row(old["id"]) or old)
+
+            self.conn.execute(
+                """
+                INSERT INTO deploy_queue (
+                  id, environment_id, task_id, actor, agent_id, agent_name,
+                  branch, commit_sha, source_repo_path, services, health_check,
+                  priority, status, callback_url, callback_api_key,
+                  requested_at, updated_at, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                """,
+                (
+                    queue_id,
+                    environment_id,
+                    str(task_id),
+                    actor,
+                    str(agent_id) if agent_id is not None else None,
+                    agent_name,
+                    branch,
+                    commit,
+                    source_repo_path,
+                    services,
+                    1 if health_check else 0,
+                    int(priority),
+                    callback_url,
+                    callback_api_key,
+                    now,
+                    now,
+                    json.dumps(metadata or {}, sort_keys=True),
+                ),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+        queue = self._queue_row(queue_id) or {}
+        callbacks = []
+        for old in superseded:
+            callbacks.append(self._send_callback(
+                old,
+                "superseded",
+                f"Queued deploy request superseded by newer request {queue_id}.",
+                error={"superseded_by": queue_id},
+            ))
+        callbacks.append(self._send_callback(
+            queue,
+            "dev_deploy_queued",
+            f"Deploy queued for {environment_id}; position {self._queue_position(queue_id)}.",
+        ))
+        return {
+            "ok": True,
+            "status": "queued",
+            "environment": env,
+            "queue": self._public_queue({**queue, "position": self._queue_position(queue_id)}),
+            "superseded": [self._public_queue(entry) for entry in superseded],
+            "callbacks": callbacks,
+        }
+
+    def queue_status(self, environment_id: Optional[str] = None, include_terminal: bool = False) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "queue": self._queue_entries(environment_id, include_terminal=include_terminal),
+        }
+
+    def cancel_queue_request(self, queue_id: str, actor: str, message: Optional[str] = None) -> Dict[str, Any]:
+        if not actor:
+            return {"ok": False, "error": "actor is required"}
+        queue = self._queue_row(queue_id)
+        if not queue:
+            return {"ok": False, "error": "queue_request_not_found", "queue_id": queue_id}
+        if queue["status"] != "queued":
+            return {
+                "ok": False,
+                "error": "queue_request_not_cancellable",
+                "queue": self._public_queue(queue),
+                "allowed_status": "queued",
+            }
+        cancelled = self._set_queue_status(queue_id, "cancelled", error={"actor": actor, "message": message})
+        callback = self._send_callback(
+            cancelled,
+            "cancelled",
+            message or f"Queued deploy request {queue_id} cancelled by {actor}.",
+        )
+        return {"ok": True, "status": "cancelled", "queue": self._public_queue(cancelled), "callback": callback}
 
     def transition(self, lease_id: str, event_type: str, actor: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if event_type not in ALLOWED_TRANSITIONS:
@@ -313,7 +604,15 @@ class LeaseManager:
             stale = False
             if lease and lease.get("heartbeat_at"):
                 stale = (now_dt - parse_time(lease["heartbeat_at"])).total_seconds() > int(env["stale_after_seconds"])
-            item = {"environment": env, "available": lease is None, "active_lease": lease, "stale": stale}
+            queue_entries = self._queue_entries(env["id"])
+            item = {
+                "environment": env,
+                "available": lease is None,
+                "active_lease": lease,
+                "stale": stale,
+                "queue": queue_entries,
+                "queue_depth": len([entry for entry in queue_entries if entry.get("status") == "queued"]),
+            }
             if include_events and lease:
                 item["events"] = self.events(lease["id"])["events"]
             output.append(item)
@@ -394,11 +693,64 @@ class LeaseManager:
             lines.append(f"Message: {message}")
         return "\n".join(lines)
 
+    def _deploy_acquired_lease(self, env: Dict[str, Any], lease_id: str, environment_id: str,
+                               task_id: str, actor: str, source_repo_path: str,
+                               commit: Optional[str], services: str, health_check: bool,
+                               dry_run: bool, timeout_seconds: int) -> Dict[str, Any]:
+        if dry_run:
+            deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"dry_run": True, "served_commit": commit})
+            deployed["deploy"] = {"dry_run": True}
+            return deployed
+
+        metadata = env.get("metadata") or {}
+        deploy_mode = str(metadata.get("deploy_mode") or ("command" if env.get("deploy_command") else "native")).strip().lower()
+        if deploy_mode == "command":
+            deploy_payload = self._command_deploy(env, lease_id, environment_id, task_id, actor, source_repo_path, commit, services, health_check, timeout_seconds)
+            if not deploy_payload.get("ok"):
+                released = self.release(lease_id, actor, "deploy_failed", deploy_payload.get("message") or deploy_payload.get("stderr") or "deploy command failed")
+                released["deploy"] = deploy_payload
+                return released
+        else:
+            try:
+                deploy_payload = NativeDevDeployer().deploy(
+                    env,
+                    source_repo_path,
+                    services=services,
+                    health_check=health_check,
+                    expected_commit=commit,
+                    timeout_seconds=timeout_seconds,
+                )
+            except NativeDeployError as exc:
+                deploy_payload = exc.payload()
+                released = self.release(lease_id, actor, "deploy_failed", deploy_payload.get("error", "native deploy failed"))
+                released["deploy"] = deploy_payload
+                return released
+
+        served_commit = commit
+        served_cmd = env.get("served_commit_command")
+        if served_cmd:
+            served = subprocess.run(served_cmd, shell=True, text=True, capture_output=True, timeout=60)
+            if served.returncode != 0:
+                released = self.release(lease_id, actor, "deploy_failed", served.stderr[-1000:] or "served commit command failed")
+                released["deploy"] = deploy_payload
+                return released
+            served_commit = served.stdout.strip()
+        if commit and served_commit and commit != served_commit:
+            released = self.release(lease_id, actor, "deploy_failed", f"served commit {served_commit} did not match expected {commit}")
+            released["deploy"] = deploy_payload
+            return released
+        deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"served_commit": served_commit, "deploy": deploy_payload})
+        deployed["deploy"] = deploy_payload
+        return deployed
+
     def lease_aware_deploy(self, environment_id: str, task_id: str, actor: str, source_repo_path: str,
                            agent_id: Optional[str] = None, agent_name: Optional[str] = None,
                            branch: Optional[str] = None, commit: Optional[str] = None,
                            services: str = "both", health_check: bool = True,
-                           dry_run: bool = False, timeout_seconds: int = 1800) -> Dict[str, Any]:
+                           dry_run: bool = False, timeout_seconds: int = 1800,
+                           queue_if_busy: bool = False, priority: int = 0,
+                           callback_url: Optional[str] = None,
+                           callback_api_key: Optional[str] = None) -> Dict[str, Any]:
         env = self._environment(environment_id)
         if not env:
             return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
@@ -417,6 +769,23 @@ class LeaseManager:
         )
         superseded_lease = acquire.get("superseded_lease")
         if not acquire.get("ok"):
+            if queue_if_busy and acquire.get("error") == "environment_busy":
+                return self.enqueue_deploy_request(
+                    environment_id,
+                    task_id,
+                    actor,
+                    source_repo_path,
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    branch=branch,
+                    commit=commit,
+                    services=services,
+                    health_check=health_check,
+                    priority=priority,
+                    callback_url=callback_url,
+                    callback_api_key=callback_api_key,
+                    metadata={"busy_owner": acquire.get("owner")},
+                )
             if superseded_lease:
                 acquire["superseded_lease"] = superseded_lease
             return acquire
@@ -426,63 +795,147 @@ class LeaseManager:
             if superseded_lease:
                 deploying["superseded_lease"] = superseded_lease
             return deploying
-        if dry_run:
-            deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"dry_run": True, "served_commit": commit})
-            deployed["deploy"] = {"dry_run": True}
-            if superseded_lease:
-                deployed["superseded_lease"] = superseded_lease
-            return deployed
 
-        metadata = env.get("metadata") or {}
-        deploy_mode = str(metadata.get("deploy_mode") or ("command" if env.get("deploy_command") else "native")).strip().lower()
-        if deploy_mode == "command":
-            deploy_payload = self._command_deploy(env, lease_id, environment_id, task_id, actor, source_repo_path, commit, services, health_check, timeout_seconds)
-            if not deploy_payload.get("ok"):
-                released = self.release(lease_id, actor, "deploy_failed", deploy_payload.get("message") or deploy_payload.get("stderr") or "deploy command failed")
-                released["deploy"] = deploy_payload
-                if superseded_lease:
-                    released["superseded_lease"] = superseded_lease
-                return released
-        else:
-            try:
-                deploy_payload = NativeDevDeployer().deploy(
-                    env,
-                    source_repo_path,
-                    services=services,
-                    health_check=health_check,
-                    expected_commit=commit,
-                    timeout_seconds=timeout_seconds,
-                )
-            except NativeDeployError as exc:
-                deploy_payload = exc.payload()
-                released = self.release(lease_id, actor, "deploy_failed", deploy_payload.get("error", "native deploy failed"))
-                released["deploy"] = deploy_payload
-                if superseded_lease:
-                    released["superseded_lease"] = superseded_lease
-                return released
-
-        served_commit = commit
-        served_cmd = env.get("served_commit_command")
-        if served_cmd:
-            served = subprocess.run(served_cmd, shell=True, text=True, capture_output=True, timeout=60)
-            if served.returncode != 0:
-                released = self.release(lease_id, actor, "deploy_failed", served.stderr[-1000:] or "served commit command failed")
-                released["deploy"] = deploy_payload
-                if superseded_lease:
-                    released["superseded_lease"] = superseded_lease
-                return released
-            served_commit = served.stdout.strip()
-        if commit and served_commit and commit != served_commit:
-            released = self.release(lease_id, actor, "deploy_failed", f"served commit {served_commit} did not match expected {commit}")
-            released["deploy"] = deploy_payload
-            if superseded_lease:
-                released["superseded_lease"] = superseded_lease
-            return released
-        deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"served_commit": served_commit, "deploy": deploy_payload})
-        deployed["deploy"] = deploy_payload
+        deployed = self._deploy_acquired_lease(
+            env,
+            lease_id,
+            environment_id,
+            task_id,
+            actor,
+            source_repo_path,
+            commit,
+            services,
+            health_check,
+            dry_run,
+            timeout_seconds,
+        )
         if superseded_lease:
             deployed["superseded_lease"] = superseded_lease
         return deployed
+
+    def _next_queued_request(self, environment_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM deploy_queue
+            WHERE environment_id = ?
+              AND status = 'queued'
+            ORDER BY priority DESC, requested_at ASC, id ASC
+            LIMIT 1
+            """,
+            (environment_id,),
+        ).fetchone()
+        return row_to_dict(row)
+
+    def sweep_deploy_queue(self, actor: str, environment_id: Optional[str] = None,
+                           limit: int = 1, dry_run: bool = False,
+                           timeout_seconds: int = 1800) -> Dict[str, Any]:
+        if not actor:
+            return {"ok": False, "error": "actor is required"}
+        if limit <= 0:
+            return {"ok": False, "error": "limit must be positive"}
+
+        env_ids = [environment_id] if environment_id else [
+            item["environment"]["id"] for item in self.status()["environments"]
+        ]
+        processed = []
+        skipped = []
+        for env_id in env_ids:
+            if len(processed) >= limit:
+                break
+            env = self._environment(str(env_id))
+            if not env:
+                skipped.append({"environment_id": env_id, "reason": "environment_not_found"})
+                continue
+            active = self._active_lease(str(env_id))
+            if active:
+                skipped.append({"environment_id": env_id, "reason": "environment_busy", "lease": active})
+                continue
+            queue = self._next_queued_request(str(env_id))
+            if not queue:
+                skipped.append({"environment_id": env_id, "reason": "queue_empty"})
+                continue
+
+            acquire = self.acquire(
+                str(env_id),
+                str(queue["task_id"]),
+                actor,
+                queue.get("agent_id"),
+                queue.get("agent_name"),
+                queue.get("branch"),
+                queue.get("commit_sha"),
+                {
+                    "source_repo_path": queue.get("source_repo_path"),
+                    "queue_id": queue["id"],
+                },
+                supersede_same_task_review=True,
+            )
+            if not acquire.get("ok"):
+                skipped.append({"environment_id": env_id, "queue": self._public_queue(queue), "reason": acquire.get("error"), "result": acquire})
+                continue
+
+            lease = acquire["lease"]
+            queue = self._set_queue_status(queue["id"], "deploying", lease_id=lease["id"])
+            callbacks = [
+                self._send_callback(
+                    queue,
+                    "dev_deploying",
+                    f"Queued deploy {queue['id']} is deploying to {env_id}.",
+                    lease=lease,
+                )
+            ]
+
+            deploying = self.transition(lease["id"], "mark_deploying", actor)
+            if not deploying.get("ok"):
+                error = {"stage": "mark_deploying", "result": deploying}
+                failed_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
+                callbacks.append(self._send_callback(
+                    failed_queue,
+                    "deploy_failed",
+                    f"Queued deploy {queue['id']} failed before deployment.",
+                    lease=lease,
+                    error=error,
+                ))
+                processed.append({"queue": self._public_queue(failed_queue), "result": deploying, "callbacks": callbacks})
+                continue
+
+            result = self._deploy_acquired_lease(
+                env,
+                lease["id"],
+                str(env_id),
+                str(queue["task_id"]),
+                actor,
+                str(queue["source_repo_path"]),
+                queue.get("commit_sha"),
+                str(queue.get("services") or "both"),
+                bool(queue.get("health_check")),
+                dry_run,
+                timeout_seconds,
+            )
+
+            latest_lease = self._lease(lease["id"]) or lease
+            if result.get("status") == "deployed_for_qa":
+                final_queue = self._set_queue_status(queue["id"], "deployed", lease_id=lease["id"])
+                callbacks.append(self._send_callback(
+                    final_queue,
+                    "deployed_for_qa",
+                    f"Queued deploy {queue['id']} completed and is ready for QA.",
+                    lease=latest_lease,
+                ))
+            else:
+                error = {"stage": "deploy", "result": result}
+                final_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
+                callbacks.append(self._send_callback(
+                    final_queue,
+                    "deploy_failed",
+                    f"Queued deploy {queue['id']} failed.",
+                    lease=latest_lease,
+                    error=error,
+                ))
+
+            processed.append({"queue": self._public_queue(final_queue), "result": result, "callbacks": callbacks})
+
+        return {"ok": True, "processed": processed, "skipped": skipped}
 
     def _command_deploy(self, env: Dict[str, Any], lease_id: str, environment_id: str, task_id: str,
                         actor: str, source_repo_path: str, commit: Optional[str], services: str,

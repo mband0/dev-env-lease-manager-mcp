@@ -20,6 +20,18 @@ TERMINAL_STATUSES = {
     "superseded",
 }
 
+QUEUE_ACTIVE_STATUSES = {
+    "queued",
+    "deploying",
+}
+
+QUEUE_TERMINAL_STATUSES = {
+    "deployed",
+    "failed",
+    "cancelled",
+    "superseded",
+}
+
 RELEASE_REASON_TO_STATUS = {
     "deploy_failed": "deploy_failed",
     "qa_failed": "qa_failed",

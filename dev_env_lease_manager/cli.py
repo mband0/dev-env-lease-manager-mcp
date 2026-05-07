@@ -24,6 +24,10 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--environment-id")
     status.add_argument("--events", action="store_true")
 
+    queue_status = sub.add_parser("queue-status")
+    queue_status.add_argument("--environment-id")
+    queue_status.add_argument("--include-terminal", action="store_true")
+
     acquire = sub.add_parser("acquire")
     acquire.add_argument("environment_id")
     acquire.add_argument("--task-id", required=True)
@@ -64,6 +68,17 @@ def build_parser() -> argparse.ArgumentParser:
     sweep = sub.add_parser("sweep-stale")
     sweep.add_argument("--actor", required=True)
 
+    sweep_queue = sub.add_parser("sweep-deploy-queue")
+    sweep_queue.add_argument("--actor", required=True)
+    sweep_queue.add_argument("--environment-id")
+    sweep_queue.add_argument("--limit", type=int, default=1)
+    sweep_queue.add_argument("--dry-run", action="store_true")
+
+    cancel_queue = sub.add_parser("cancel-queue")
+    cancel_queue.add_argument("--queue-id", required=True)
+    cancel_queue.add_argument("--actor", required=True)
+    cancel_queue.add_argument("--message")
+
     events = sub.add_parser("events")
     events.add_argument("--lease-id", required=True)
 
@@ -85,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
     deploy.add_argument("--services", default="both")
     deploy.add_argument("--no-health-check", action="store_true")
     deploy.add_argument("--dry-run", action="store_true")
+    deploy.add_argument("--queue-if-busy", action="store_true")
+    deploy.add_argument("--priority", type=int, default=0)
+    deploy.add_argument("--callback-url")
+    deploy.add_argument("--callback-api-key")
 
     return parser
 
@@ -98,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         command_map: dict[str, Callable[[], dict[str, Any]]] = {
             "health": lambda: {"ok": True, "data_path": config.data_path, "environment_count": len(config.environments)},
             "status": lambda: manager.status(args.environment_id, args.events),
+            "queue-status": lambda: manager.queue_status(args.environment_id, args.include_terminal),
             "acquire": lambda: manager.acquire(
                 args.environment_id, args.task_id, args.actor, args.agent_id,
                 args.agent_name, args.branch, args.commit,
@@ -118,6 +138,13 @@ def main(argv: list[str] | None = None) -> int:
             "mark-done": lambda: manager.release(args.lease_id, args.actor, "done", args.message),
             "force-release": lambda: manager.force_release(args.actor, args.reason, args.lease_id, args.environment_id),
             "sweep-stale": lambda: manager.sweep_stale(args.actor),
+            "sweep-deploy-queue": lambda: manager.sweep_deploy_queue(
+                args.actor,
+                args.environment_id,
+                args.limit,
+                args.dry_run,
+            ),
+            "cancel-queue": lambda: manager.cancel_queue_request(args.queue_id, args.actor, args.message),
             "events": lambda: manager.events(args.lease_id),
             "validate-qa": lambda: manager.validate_qa(args.task_id, args.commit, args.environment_id, args.lease_id),
             "deploy": lambda: manager.lease_aware_deploy(
@@ -132,6 +159,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.services,
                 not args.no_health_check,
                 args.dry_run,
+                queue_if_busy=args.queue_if_busy,
+                priority=args.priority,
+                callback_url=args.callback_url,
+                callback_api_key=args.callback_api_key,
             ),
         }
         return print_json(command_map[args.command]())

@@ -30,6 +30,8 @@ python3.11 -m venv .venv
 .venv/bin/dev-env-lease mark-deployed-for-qa --lease-id <lease>
 .venv/bin/dev-env-lease release --lease-id <lease> --reason qa_failed --actor quinn
 .venv/bin/dev-env-lease force-release --environment-id agent-hq-dev --actor operator:admin --reason stale
+.venv/bin/dev-env-lease queue-status --environment-id agent-hq-dev
+.venv/bin/dev-env-lease sweep-deploy-queue --environment-id agent-hq-dev --actor queue-worker
 ```
 
 See [docs/lease-contract.md](docs/lease-contract.md) for the contract, state

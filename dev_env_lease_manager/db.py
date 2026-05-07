@@ -68,6 +68,31 @@ def init_schema(conn: sqlite3.Connection) -> None:
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS deploy_queue (
+      id TEXT PRIMARY KEY,
+      environment_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+      task_id TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      agent_id TEXT,
+      agent_name TEXT,
+      branch TEXT,
+      commit_sha TEXT,
+      source_repo_path TEXT NOT NULL,
+      services TEXT NOT NULL DEFAULT 'both',
+      health_check INTEGER NOT NULL DEFAULT 1,
+      priority INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL,
+      callback_url TEXT,
+      callback_api_key TEXT,
+      lease_id TEXT,
+      requested_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      updated_at TEXT NOT NULL,
+      error_json TEXT NOT NULL DEFAULT '{}',
+      metadata_json TEXT NOT NULL DEFAULT '{}'
+    );
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_active_environment_lease
       ON leases(environment_id)
       WHERE released_at IS NULL
@@ -75,6 +100,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
 
     CREATE INDEX IF NOT EXISTS idx_lease_events_lease ON lease_events(lease_id, id);
     CREATE INDEX IF NOT EXISTS idx_leases_task ON leases(task_id);
+    CREATE INDEX IF NOT EXISTS idx_deploy_queue_environment_status
+      ON deploy_queue(environment_id, status, priority DESC, requested_at ASC);
+    CREATE INDEX IF NOT EXISTS idx_deploy_queue_task
+      ON deploy_queue(environment_id, task_id, status);
     """)
 
 
@@ -114,4 +143,3 @@ def sync_environments(conn: sqlite3.Connection, config: LeaseManagerConfig, now:
                 now,
             ),
         )
-

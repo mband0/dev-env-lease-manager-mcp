@@ -10,6 +10,7 @@ The server runs over MCP stdio:
 
 - `dev_env_health`
 - `dev_env_status`
+- `dev_env_queue_status`
 - `dev_env_acquire`
 - `dev_env_mark_deploying`
 - `dev_env_mark_deployed_for_qa`
@@ -22,6 +23,8 @@ The server runs over MCP stdio:
 - `dev_env_force_release`
 - `dev_env_heartbeat`
 - `dev_env_sweep_stale`
+- `dev_env_sweep_deploy_queue`
+- `dev_env_cancel_queue`
 - `dev_env_validate_qa`
 - `dev_env_events`
 - `dev_env_deploy_worktree`
@@ -35,6 +38,21 @@ legacy external command path with `metadata.deploy_mode = "command"`.
 Busy environment responses include owner task, agent, branch, commit, lease id,
 environment, and next action guidance. Agents must treat `environment_busy` as a
 blocked/waiting state and must not mutate the shared checkout manually.
+
+When `dev_env_deploy_worktree` is called with `queue_if_busy = true`, a busy
+environment creates a durable deploy queue entry instead of returning blocked
+semantics. The queued response includes `queue.id`, `queue.position`, branch,
+commit, and source repo path. `dev_env_queue_status` reports queued/deploying
+requests and positions, `dev_env_cancel_queue` cancels a request that has not
+started, and `dev_env_sweep_deploy_queue` deploys the next queued request for an
+available environment.
+
+Queued deploys can call Agent HQ's external task event endpoint. Provide
+`callback_url` as either the Agent HQ base URL or
+`/api/v1/external/task-events`, and `callback_api_key` as an Agent HQ MCP API
+key for the `dev_environment_lease_manager` service agent or Atlas. Callback
+events are `dev_deploy_queued`, `dev_deploying`, `deployed_for_qa`,
+`deploy_failed`, `cancelled`, and `superseded`.
 
 ## Example Acquire
 

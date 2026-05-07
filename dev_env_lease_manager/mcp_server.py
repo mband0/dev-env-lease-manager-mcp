@@ -21,6 +21,10 @@ class LeaseManagerMcpTools:
                 "data_path": self.manager.config.data_path,
             },
             "dev_env_status": lambda a: self.manager.status(a.get("environment_id"), bool(a.get("include_events", False))),
+            "dev_env_queue_status": lambda a: self.manager.queue_status(
+                a.get("environment_id"),
+                bool(a.get("include_terminal", False)),
+            ),
             "dev_env_acquire": lambda a: self.manager.acquire(
                 a["environment_id"],
                 a["task_id"],
@@ -56,6 +60,17 @@ class LeaseManagerMcpTools:
             ),
             "dev_env_heartbeat": lambda a: self.manager.heartbeat(a["lease_id"], a["actor"]),
             "dev_env_sweep_stale": lambda a: self.manager.sweep_stale(a["actor"]),
+            "dev_env_sweep_deploy_queue": lambda a: self.manager.sweep_deploy_queue(
+                a["actor"],
+                a.get("environment_id"),
+                int(a.get("limit") or 1),
+                bool(a.get("dry_run", False)),
+            ),
+            "dev_env_cancel_queue": lambda a: self.manager.cancel_queue_request(
+                a["queue_id"],
+                a["actor"],
+                a.get("message"),
+            ),
             "dev_env_validate_qa": lambda a: self.manager.validate_qa(
                 a["task_id"],
                 a["commit"],
@@ -75,6 +90,10 @@ class LeaseManagerMcpTools:
                 a.get("services", "both"),
                 bool(a.get("health_check", True)),
                 bool(a.get("dry_run", False)),
+                queue_if_busy=bool(a.get("queue_if_busy", False)),
+                priority=int(a.get("priority") or 0),
+                callback_url=a.get("callback_url"),
+                callback_api_key=a.get("callback_api_key"),
             ),
         }
         if name not in handlers:
@@ -100,6 +119,17 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
         return service.call_tool("dev_env_status", {
             "environment_id": environment_id,
             "include_events": include_events,
+        })
+
+    @mcp.tool()
+    def dev_env_queue_status(
+        environment_id: Optional[str] = None,
+        include_terminal: bool = False,
+    ) -> Dict[str, Any]:
+        """List queued deploy requests and active queue positions."""
+        return service.call_tool("dev_env_queue_status", {
+            "environment_id": environment_id,
+            "include_terminal": include_terminal,
         })
 
     @mcp.tool()
@@ -239,6 +269,34 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
         return service.call_tool("dev_env_sweep_stale", {"actor": actor})
 
     @mcp.tool()
+    def dev_env_sweep_deploy_queue(
+        actor: str,
+        environment_id: Optional[str] = None,
+        limit: int = 1,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Deploy queued requests for available environments."""
+        return service.call_tool("dev_env_sweep_deploy_queue", {
+            "actor": actor,
+            "environment_id": environment_id,
+            "limit": limit,
+            "dry_run": dry_run,
+        })
+
+    @mcp.tool()
+    def dev_env_cancel_queue(
+        queue_id: str,
+        actor: str,
+        message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Cancel a queued deploy request before it starts deploying."""
+        return service.call_tool("dev_env_cancel_queue", {
+            "queue_id": queue_id,
+            "actor": actor,
+            "message": message,
+        })
+
+    @mcp.tool()
     def dev_env_validate_qa(
         task_id: str,
         commit: str,
@@ -271,6 +329,10 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
         services: str = "both",
         health_check: bool = True,
         dry_run: bool = False,
+        queue_if_busy: bool = False,
+        priority: int = 0,
+        callback_url: Optional[str] = None,
+        callback_api_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Lease-aware deploy wrapper around the configured deploy command."""
         return service.call_tool("dev_env_deploy_worktree", {
@@ -285,6 +347,10 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
             "services": services,
             "health_check": health_check,
             "dry_run": dry_run,
+            "queue_if_busy": queue_if_busy,
+            "priority": priority,
+            "callback_url": callback_url,
+            "callback_api_key": callback_api_key,
         })
 
     return mcp

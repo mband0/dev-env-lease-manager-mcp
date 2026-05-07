@@ -19,14 +19,17 @@ Use the MCP tool:
   "branch": "cinder/task-426",
   "commit": "abc123",
   "services": "both",
-  "health_check": true
+  "health_check": true,
+  "queue_if_busy": true,
+  "callback_url": "http://localhost:3501",
+  "callback_api_key": "ahq_mcp_..."
 }
 ```
 
 Equivalent CLI:
 
 ```sh
-.venv/bin/dev-env-lease --config config/environments.json deploy agent-hq-dev --task-id 426 --actor cinder-backend --source-repo-path /path/to/agent/worktree --branch cinder/task-426 --commit abc123
+.venv/bin/dev-env-lease --config config/environments.json deploy agent-hq-dev --task-id 426 --actor cinder-backend --source-repo-path /path/to/agent/worktree --branch cinder/task-426 --commit abc123 --queue-if-busy --callback-url http://localhost:3501 --callback-api-key "$AGENT_HQ_MCP_API_KEY"
 ```
 
 The deploy path acquires a lease, marks it `deploying`, promotes the exact clean
@@ -43,6 +46,17 @@ available only when an environment explicitly sets deploy mode to `command`.
 If the tool returns `environment_busy`, the agent posts blocked/waiting with the
 owner task, lease id, branch, and commit from the response. The agent must not
 fall back to manual shared-checkout mutation.
+
+If `queue_if_busy` is true and the environment is busy, the tool returns
+`status: queued` with a queue id and position. This is an expected workflow
+state, not a blocked task state. The queue worker command/tool
+`sweep-deploy-queue` / `dev_env_sweep_deploy_queue` deploys the exact recorded
+commit once the environment is available. New queued requests for the same task
+supersede older queued requests so stale commits do not deploy later.
+
+When callback settings are supplied, the lease manager posts Agent HQ external
+task events for `dev_deploy_queued`, `dev_deploying`, `deployed_for_qa`,
+`deploy_failed`, `cancelled`, and `superseded`.
 
 If no matching environment exists, the agent posts blocked/waiting with
 `environment_not_found`. The agent must not invent a new target or deploy to
