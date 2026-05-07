@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 
-from dev_env_lease_manager.deploy import NativeDeployError, NativeDevDeployer, normalize_services
+from dev_env_lease_manager.deploy import NativeDeployError, NativeDevDeployer, commit_matches_expected, normalize_services
 
 
 def write_package(path: Path, scripts: dict[str, str]) -> None:
@@ -70,6 +70,12 @@ class NativeDeployTests(unittest.TestCase):
         self.assertEqual(normalize_services("api"), ["api"])
         with self.assertRaises(NativeDeployError):
             normalize_services("worker")
+
+    def test_commit_matches_expected_accepts_git_abbreviations(self) -> None:
+        self.assertTrue(commit_matches_expected("94e572c63b18fe419cffc7368c417c3c0828723a", "94e572c"))
+        self.assertTrue(commit_matches_expected("94e572c63b18fe419cffc7368c417c3c0828723a", "94e572c63b18fe419cffc7368c417c3c0828723a"))
+        self.assertFalse(commit_matches_expected("94e572c63b18fe419cffc7368c417c3c0828723a", "94e572d"))
+        self.assertFalse(commit_matches_expected("94e572c63b18fe419cffc7368c417c3c0828723a", "94e"))
 
     def test_native_deploy_promotes_exact_head_and_restarts_services(self) -> None:
         _, source, dev, canonical = self.make_layout()

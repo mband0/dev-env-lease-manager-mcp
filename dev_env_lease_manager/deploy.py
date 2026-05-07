@@ -14,6 +14,18 @@ import urllib.request
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+def commit_matches_expected(actual: str, expected: Optional[str]) -> bool:
+    if not expected:
+        return True
+    actual = actual.strip().lower()
+    expected = expected.strip().lower()
+    if not actual or not expected:
+        return False
+    if actual == expected:
+        return True
+    return len(expected) >= 7 and len(expected) < 40 and actual.startswith(expected)
+
+
 @dataclass
 class NativeDeployError(Exception):
     error: str
@@ -224,7 +236,7 @@ class NativeDevDeployer:
                 )
 
             source_sha = self._git(source_root, "rev-parse", "HEAD").stdout.strip()
-            if expected_commit and source_sha != expected_commit:
+            if not commit_matches_expected(source_sha, expected_commit):
                 raise NativeDeployError(
                     "source HEAD does not match expected commit",
                     {"source_sha": source_sha, "expected_commit": expected_commit},

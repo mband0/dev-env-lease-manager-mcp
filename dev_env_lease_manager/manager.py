@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from .config import LeaseManagerConfig
 from .db import connect, sync_environments
-from .deploy import NativeDeployError, NativeDevDeployer
+from .deploy import NativeDeployError, NativeDevDeployer, commit_matches_expected
 from .models import (
     ACTIVE_STATUSES,
     ALLOWED_TRANSITIONS,
@@ -782,7 +782,7 @@ class LeaseManager:
                 released["deploy"] = deploy_payload
                 return released
             served_commit = served.stdout.strip()
-        if commit and served_commit and commit != served_commit:
+        if served_commit and not commit_matches_expected(served_commit, commit):
             released = self.release(
                 lease_id,
                 actor,
