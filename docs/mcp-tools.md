@@ -48,6 +48,11 @@ requests and positions, `dev_env_cancel_queue` cancels a request that has not
 started, and `dev_env_sweep_deploy_queue` deploys the next queued request for an
 available environment.
 
+Queue status derives `metadata.busy_owner` from the environment's current active
+lease at read time. Historical blocker snapshots remain available as
+`metadata.queued_because_owner`, so older queued rows do not present stale queue
+time ownership as current truth.
+
 Queued deploys can call Agent HQ's external task event endpoint. Provide
 `callback_url` as either the Agent HQ base URL or
 `/api/v1/external/task-events`, and `callback_api_key` as an Agent HQ MCP API

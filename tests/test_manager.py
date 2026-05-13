@@ -227,6 +227,60 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertEqual(status["active_lease"]["id"], active["id"])
         self.assertEqual(status["queue_depth"], 1)
         self.assertEqual(status["queue"][0]["commit_sha"], "queued-commit")
+        self.assertEqual(status["queue"][0]["metadata"]["busy_owner"]["task_id"], "425")
+        self.assertEqual(status["queue"][0]["metadata"]["queued_because_owner"]["task_id"], "425")
+
+    def test_queue_status_clears_busy_owner_after_lease_release(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        active = manager.acquire("agent-hq-dev", "425", "anchor", commit="active")["lease"]
+        queued = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "426",
+            "cinder",
+            str(source),
+            branch="task-426",
+            commit="queued-commit",
+            dry_run=True,
+            queue_if_busy=True,
+        )["queue"]
+
+        manager.release(active["id"], "anchor", "manual_release", sweep_queue_after_release=False)
+
+        status = manager.queue_status("agent-hq-dev", include_terminal=True)["queue"]
+        entry = next(item for item in status if item["id"] == queued["id"])
+        self.assertIsNone(entry["metadata"]["busy_owner"])
+        self.assertEqual(entry["metadata"]["queued_because_owner"]["task_id"], "425")
+
+    def test_queue_status_uses_current_active_lease_not_legacy_busy_snapshot(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        original = manager.acquire("agent-hq-dev", "425", "anchor", commit="active-1")["lease"]
+        queued = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "426",
+            "cinder",
+            str(source),
+            branch="task-426",
+            commit="queued-commit",
+            dry_run=True,
+            queue_if_busy=True,
+        )["queue"]
+        manager.release(original["id"], "anchor", "manual_release", sweep_queue_after_release=False)
+        current = manager.acquire("agent-hq-dev", "489", "prism", commit="active-2")["lease"]
+
+        manager.conn.execute(
+            "UPDATE deploy_queue SET metadata_json = ? WHERE id = ?",
+            (json.dumps({"busy_owner": queued["metadata"]["queued_because_owner"]}, sort_keys=True), queued["id"]),
+        )
+
+        status = manager.queue_status("agent-hq-dev", include_terminal=True)["queue"]
+        entry = next(item for item in status if item["id"] == queued["id"])
+        self.assertEqual(entry["metadata"]["busy_owner"]["task_id"], "489")
+        self.assertEqual(entry["metadata"]["busy_owner"]["lease_id"], current["id"])
+        self.assertEqual(entry["metadata"]["queued_because_owner"]["task_id"], "425")
 
     def test_sweep_deploy_queue_deploys_exact_queued_commit_after_release(self) -> None:
         manager, tmp = self.make_manager()

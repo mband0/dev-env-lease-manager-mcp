@@ -25,6 +25,7 @@ from .models import (
 
 
 CALLBACK_SOURCE = "dev_environment_lease_manager"
+_MISSING = object()
 
 
 def utc_now() -> str:
@@ -88,8 +89,36 @@ class LeaseManager:
     def _queue_row(self, queue_id: str) -> Optional[Dict[str, Any]]:
         return row_to_dict(self.conn.execute("SELECT * FROM deploy_queue WHERE id = ?", (queue_id,)).fetchone())
 
-    def _public_queue(self, queue: Dict[str, Any]) -> Dict[str, Any]:
+    def _lease_owner(self, lease: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not lease:
+            return None
+        return {
+            "task_id": lease.get("task_id"),
+            "agent_id": lease.get("agent_id"),
+            "agent_name": lease.get("agent_name"),
+            "branch": lease.get("branch"),
+            "commit": lease.get("commit_sha"),
+            "lease_id": lease.get("id"),
+            "status": lease.get("status"),
+        }
+
+    def _public_queue(self, queue: Dict[str, Any], active_lease: Any = _MISSING) -> Dict[str, Any]:
         public = dict(queue)
+        metadata = dict(public.get("metadata") or {})
+        if active_lease is _MISSING:
+            environment_id = public.get("environment_id")
+            active_lease = self._active_lease(str(environment_id)) if environment_id else None
+
+        queued_because_owner = metadata.get("queued_because_owner")
+        if queued_because_owner is None and "busy_owner" in metadata:
+            queued_because_owner = metadata.get("busy_owner")
+
+        current_busy_owner = self._lease_owner(active_lease)
+        if queued_because_owner is not None:
+            metadata["queued_because_owner"] = queued_because_owner
+        if current_busy_owner is not None or queued_because_owner is not None or "busy_owner" in metadata:
+            metadata["busy_owner"] = current_busy_owner
+        public["metadata"] = metadata
         public.pop("callback_api_key", None)
         return public
 
@@ -150,9 +179,13 @@ class LeaseManager:
         ).fetchall()
         entries = [row_to_dict(row) for row in rows]
         output = [entry for entry in entries if entry]
+        active_leases: dict[str, Optional[Dict[str, Any]]] = {}
         for entry in output:
             entry["position"] = self._queue_position(entry["id"])
-        return [self._public_queue(entry) for entry in output]
+            env_id = str(entry["environment_id"])
+            if env_id not in active_leases:
+                active_leases[env_id] = self._active_lease(env_id)
+        return [self._public_queue(entry, active_leases[str(entry["environment_id"])]) for entry in output]
 
     def _event(self, lease_id: Optional[str], environment_id: str, task_id: Optional[str], actor: str,
                event_type: str, from_status: Optional[str], to_status: Optional[str],
@@ -264,15 +297,7 @@ class LeaseManager:
             "error": "environment_busy",
             "environment": env,
             "lease": lease,
-            "owner": {
-                "task_id": lease.get("task_id"),
-                "agent_id": lease.get("agent_id"),
-                "agent_name": lease.get("agent_name"),
-                "branch": lease.get("branch"),
-                "commit": lease.get("commit_sha"),
-                "lease_id": lease.get("id"),
-                "status": lease.get("status"),
-            },
+            "owner": self._lease_owner(lease),
             "next_action": "Do not deploy or mutate the shared dev checkout. Post blocked/waiting with this lease id, or ask an operator to force release if the lease is stale.",
         }
 
@@ -973,7 +998,7 @@ class LeaseManager:
                     priority=priority,
                     callback_url=callback_url,
                     callback_api_key=callback_api_key,
-                    metadata={"busy_owner": acquire.get("owner")},
+                    metadata={"queued_because_owner": acquire.get("owner")},
                 )
             if superseded_lease:
                 acquire["superseded_lease"] = superseded_lease
