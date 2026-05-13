@@ -44,9 +44,11 @@ When `dev_env_deploy_worktree` is called with `queue_if_busy = true`, a busy
 environment creates a durable deploy queue entry instead of returning blocked
 semantics. The queued response includes `queue.id`, `queue.position`, branch,
 commit, and source repo path. `dev_env_queue_status` reports queued/deploying
-requests and positions, `dev_env_cancel_queue` cancels a request that has not
-started, and `dev_env_sweep_deploy_queue` deploys the next queued request for an
-available environment.
+requests and positions, derives `busy_owner` from the current active lease for
+each environment, and preserves the original queue-time blocker as
+`queued_because_owner` for audit/debugging. `dev_env_cancel_queue` cancels a
+request that has not started, and `dev_env_sweep_deploy_queue` deploys the next
+queued request for an available environment.
 
 Queued deploys can call Agent HQ's external task event endpoint. Provide
 `callback_url` as either the Agent HQ base URL or

@@ -74,6 +74,8 @@ class McpServerTests(unittest.TestCase):
         self.assertTrue(status["ok"])
         self.assertEqual(status["queue"][0]["id"], queued["id"])
         self.assertEqual(status["queue"][0]["position"], 1)
+        self.assertEqual(status["queue"][0]["busy_owner"]["task_id"], "425")
+        self.assertEqual(status["queue"][0]["queued_because_owner"]["task_id"], "425")
 
         cancelled = service.call_tool("dev_env_cancel_queue", {
             "queue_id": queued["id"],

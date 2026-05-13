@@ -228,6 +228,91 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertEqual(status["queue_depth"], 1)
         self.assertEqual(status["queue"][0]["commit_sha"], "queued-commit")
 
+    def test_queue_status_reports_current_busy_owner_from_active_lease(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        active = manager.acquire("agent-hq-dev", "425", "anchor", agent_name="Anchor", commit="active")["lease"]
+        queued = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "426",
+            "cinder",
+            str(source),
+            branch="task-426",
+            commit="queued-commit",
+            queue_if_busy=True,
+        )["queue"]
+
+        entry = manager.queue_status("agent-hq-dev")["queue"][0]
+
+        self.assertEqual(entry["id"], queued["id"])
+        self.assertEqual(entry["busy_owner"]["task_id"], active["task_id"])
+        self.assertEqual(entry["busy_owner"]["lease_id"], active["id"])
+        self.assertEqual(entry["queued_because_owner"]["task_id"], active["task_id"])
+        self.assertEqual(entry["metadata"]["busy_owner"]["task_id"], active["task_id"])
+        self.assertEqual(entry["metadata"]["queued_because_owner"]["task_id"], active["task_id"])
+
+    def test_queue_status_clears_busy_owner_after_release_but_keeps_queue_reason(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        active = manager.acquire("agent-hq-dev", "425", "anchor", commit="active")["lease"]
+        queued = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "426",
+            "cinder",
+            str(source),
+            branch="task-426",
+            commit="queued-commit",
+            queue_if_busy=True,
+        )["queue"]
+
+        manager.force_release("operator", "free queue", lease_id=active["id"], sweep_queue_after_release=False)
+        entry = manager.queue_status("agent-hq-dev")["queue"][0]
+
+        self.assertEqual(entry["id"], queued["id"])
+        self.assertIsNone(entry["busy_owner"])
+        self.assertEqual(entry["queued_because_owner"]["task_id"], active["task_id"])
+        self.assertNotIn("busy_owner", entry["metadata"])
+        self.assertEqual(entry["metadata"]["queued_because_owner"]["task_id"], active["task_id"])
+
+    def test_queue_status_maps_legacy_busy_owner_snapshot_to_queue_reason(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        active = manager.acquire("agent-hq-dev", "425", "anchor", commit="active")["lease"]
+        queued = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "426",
+            "cinder",
+            str(source),
+            branch="task-426",
+            commit="queued-commit",
+            queue_if_busy=True,
+        )["queue"]
+
+        legacy_owner = {
+            "task_id": active["task_id"],
+            "agent_id": active["agent_id"],
+            "agent_name": active["agent_name"],
+            "branch": active["branch"],
+            "commit": active["commit_sha"],
+            "lease_id": active["id"],
+            "status": active["status"],
+        }
+        manager.conn.execute(
+            "UPDATE deploy_queue SET metadata_json = ? WHERE id = ?",
+            (json.dumps({"busy_owner": legacy_owner}), queued["id"]),
+        )
+
+        manager.force_release("operator", "free queue", lease_id=active["id"], sweep_queue_after_release=False)
+        entry = manager.queue_status("agent-hq-dev")["queue"][0]
+
+        self.assertIsNone(entry["busy_owner"])
+        self.assertEqual(entry["queued_because_owner"]["task_id"], active["task_id"])
+        self.assertNotIn("busy_owner", entry["metadata"])
+        self.assertEqual(entry["metadata"]["queued_because_owner"]["task_id"], active["task_id"])
+
     def test_sweep_deploy_queue_deploys_exact_queued_commit_after_release(self) -> None:
         manager, tmp = self.make_manager()
         source = Path(tmp.name) / "source"
