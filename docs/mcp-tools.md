@@ -40,15 +40,19 @@ Busy environment responses include owner task, agent, branch, commit, lease id,
 environment, and next action guidance. Agents must treat `environment_busy` as a
 blocked/waiting state and must not mutate the shared checkout manually.
 
-When `dev_env_deploy_worktree` is called with `queue_if_busy = true`, a busy
-environment creates a durable deploy queue entry instead of returning blocked
-semantics. The queued response includes `queue.id`, `queue.position`, branch,
-commit, and source repo path. `dev_env_queue_status` reports queued/deploying
-requests and positions, derives `busy_owner` from the current active lease for
-each environment, and preserves the original queue-time blocker as
+When `dev_env_deploy_worktree` is called with `queue_if_busy = true`,
+`environment_id` is the preferred target for that deployment pool. If the
+preferred environment is busy, the manager first tries to deploy on another idle
+environment with the same selector tags. If no matching environment is idle, it
+creates a durable deploy queue entry instead of returning blocked semantics. The
+queued response includes `queue.id`, `queue.position`,
+`requested_environment_id`, `assigned_environment_id`, branch, commit, and
+source repo path. `dev_env_queue_status` reports queued/deploying requests and
+positions, derives `busy_owner` from the current active lease for each
+environment, and preserves the original queue-time blocker as
 `queued_because_owner` for audit/debugging. `dev_env_cancel_queue` cancels a
 request that has not started, and `dev_env_sweep_deploy_queue` deploys the next
-queued request for an available environment.
+queued request for an available matching environment.
 
 Queued deploys can call Agent HQ's external task event endpoint. Provide
 `callback_url` as either the Agent HQ base URL or

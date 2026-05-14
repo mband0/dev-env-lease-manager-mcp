@@ -62,6 +62,83 @@ class LeaseManager:
     def _environment(self, environment_id: str) -> Optional[Dict[str, Any]]:
         return row_to_dict(self.conn.execute("SELECT * FROM environments WHERE id = ?", (environment_id,)).fetchone())
 
+    def _environments(self) -> list[Dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM environments ORDER BY id").fetchall()
+        return [env for env in (row_to_dict(row) for row in rows) if env]
+
+    def _environment_tags(self, env: Optional[Dict[str, Any]]) -> set[str]:
+        tags = (env or {}).get("tags") or []
+        return {str(tag) for tag in tags if str(tag).strip()}
+
+    def _environment_selector(self, env: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        tags = sorted(self._environment_tags(env))
+        return {"tags": tags} if tags else {}
+
+    def _candidate_environments_for_request(self, requested_environment_id: str) -> list[Dict[str, Any]]:
+        requested = self._environment(requested_environment_id)
+        if not requested:
+            return []
+        requested_tags = self._environment_tags(requested)
+        candidates = []
+        for env in self._environments():
+            env_id = str(env["id"])
+            if env_id == requested_environment_id:
+                candidates.append(env)
+                continue
+            if requested_tags and requested_tags.issubset(self._environment_tags(env)):
+                candidates.append(env)
+        return sorted(
+            candidates,
+            key=lambda env: (str(env["id"]) != requested_environment_id, str(env["id"])),
+        )
+
+    def _available_environment_for_request(self, requested_environment_id: str) -> Optional[Dict[str, Any]]:
+        for env in self._candidate_environments_for_request(requested_environment_id):
+            if not self._active_lease(str(env["id"])):
+                return env
+        return None
+
+    def _request_metadata(self, requested_env: Dict[str, Any], requested_environment_id: str,
+                          source_repo_path: str, assigned_environment_id: Optional[str] = None,
+                          extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {
+            "source_repo_path": source_repo_path,
+            "requested_environment_id": requested_environment_id,
+        }
+        selector = self._environment_selector(requested_env)
+        if selector:
+            metadata["environment_selector"] = selector
+        if assigned_environment_id:
+            metadata["assigned_environment_id"] = assigned_environment_id
+        metadata.update(extra or {})
+        return metadata
+
+    def _queue_requested_environment_id(self, queue: Dict[str, Any]) -> str:
+        metadata = queue.get("metadata") or {}
+        return str(metadata.get("requested_environment_id") or queue.get("environment_id"))
+
+    def _queue_selector_tags(self, queue: Dict[str, Any]) -> set[str]:
+        metadata = queue.get("metadata") or {}
+        selector = metadata.get("environment_selector") or {}
+        if isinstance(selector, dict):
+            tags = selector.get("tags") or []
+            return {str(tag) for tag in tags if str(tag).strip()}
+        return set()
+
+    def _queue_candidate_environment_ids(self, queue: Dict[str, Any]) -> set[str]:
+        requested_environment_id = self._queue_requested_environment_id(queue)
+        return {str(env["id"]) for env in self._candidate_environments_for_request(requested_environment_id)}
+
+    def _queue_matches_environment(self, queue: Dict[str, Any], env: Dict[str, Any]) -> bool:
+        env_id = str(env["id"])
+        requested_environment_id = self._queue_requested_environment_id(queue)
+        if env_id == requested_environment_id:
+            return True
+        selector_tags = self._queue_selector_tags(queue)
+        if not selector_tags:
+            selector_tags = self._environment_tags(self._environment(requested_environment_id))
+        return bool(selector_tags and selector_tags.issubset(self._environment_tags(env)))
+
     def _active_lease(self, environment_id: str) -> Optional[Dict[str, Any]]:
         placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
         return row_to_dict(self.conn.execute(
@@ -91,6 +168,12 @@ class LeaseManager:
     def _public_queue(self, queue: Dict[str, Any]) -> Dict[str, Any]:
         public = dict(queue)
         public.pop("callback_api_key", None)
+        metadata = public.get("metadata") or {}
+        public["requested_environment_id"] = metadata.get("requested_environment_id") or public.get("environment_id")
+        assigned_environment_id = metadata.get("assigned_environment_id")
+        if public.get("status") != "queued" and assigned_environment_id is None:
+            assigned_environment_id = public.get("environment_id")
+        public["assigned_environment_id"] = assigned_environment_id
         return public
 
     def _owner_from_lease(self, lease: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -109,12 +192,18 @@ class LeaseManager:
     def _queue_view(self, queue: Dict[str, Any], active_lease: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         public = self._public_queue(queue)
         metadata = dict(public.get("metadata") or {})
+        requested_environment_id = metadata.get("requested_environment_id") or public.get("environment_id")
+        assigned_environment_id = metadata.get("assigned_environment_id")
+        if public.get("status") != "queued" and assigned_environment_id is None:
+            assigned_environment_id = public.get("environment_id")
         queued_because_owner = metadata.pop("queued_because_owner", None)
         legacy_busy_owner = metadata.pop("busy_owner", None)
         if queued_because_owner is None:
             queued_because_owner = legacy_busy_owner
 
         busy_owner = self._owner_from_lease(active_lease)
+        public["requested_environment_id"] = requested_environment_id
+        public["assigned_environment_id"] = assigned_environment_id
         public["busy_owner"] = busy_owner
         if queued_because_owner is not None:
             public["queued_because_owner"] = queued_because_owner
@@ -127,35 +216,30 @@ class LeaseManager:
         return public
 
     def _queue_position(self, queue_id: str) -> Optional[int]:
-        row = self.conn.execute(
-            "SELECT environment_id, priority, requested_at FROM deploy_queue WHERE id = ? AND status = 'queued'",
+        row = row_to_dict(self.conn.execute(
+            "SELECT * FROM deploy_queue WHERE id = ? AND status = 'queued'",
             (queue_id,),
-        ).fetchone()
+        ).fetchone())
         if row is None:
             return None
-        ahead = self.conn.execute(
+        queue_pool = self._queue_candidate_environment_ids(row)
+        rows = self.conn.execute(
             """
-            SELECT COUNT(*) AS count
+            SELECT *
             FROM deploy_queue
-            WHERE environment_id = ?
-              AND status = 'queued'
-              AND (
-                priority > ?
-                OR (priority = ? AND requested_at < ?)
-                OR (priority = ? AND requested_at = ? AND id < ?)
-              )
+            WHERE status = 'queued'
+            ORDER BY priority DESC, requested_at ASC, id ASC
             """,
-            (
-                row["environment_id"],
-                row["priority"],
-                row["priority"],
-                row["requested_at"],
-                row["priority"],
-                row["requested_at"],
-                queue_id,
-            ),
-        ).fetchone()
-        return int(ahead["count"]) + 1
+        ).fetchall()
+        position = 1
+        for entry in (row_to_dict(item) for item in rows):
+            if not entry:
+                continue
+            if entry["id"] == queue_id:
+                return position
+            if self._queue_candidate_environment_ids(entry) & queue_pool:
+                position += 1
+        return position
 
     def _queue_entries(self, environment_id: Optional[str] = None,
                        include_terminal: bool = False) -> list[Dict[str, Any]]:
@@ -317,6 +401,11 @@ class LeaseManager:
         callback_url = self._callback_url(queue.get("callback_url"))
         env = self._environment(str(queue["environment_id"])) or {}
         lease_id = (lease or {}).get("id") or queue.get("lease_id") or queue["id"]
+        metadata = queue.get("metadata") or {}
+        requested_environment_id = metadata.get("requested_environment_id")
+        assigned_environment_id = metadata.get("assigned_environment_id")
+        if queue.get("status") != "queued" and assigned_environment_id is None:
+            assigned_environment_id = queue.get("environment_id")
         payload: Dict[str, Any] = {
             "source": CALLBACK_SOURCE,
             "event": event,
@@ -329,6 +418,10 @@ class LeaseManager:
             "review_url": env.get("base_url"),
             "message": message,
         }
+        if requested_environment_id:
+            payload["requested_environment_id"] = requested_environment_id
+        if assigned_environment_id:
+            payload["assigned_environment_id"] = assigned_environment_id
         if error:
             payload["error"] = error
 
@@ -428,12 +521,16 @@ class LeaseManager:
 
     def _set_queue_status(self, queue_id: str, status: str, *,
                           lease_id: Optional[str] = None,
-                          error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                          error: Optional[Dict[str, Any]] = None,
+                          environment_id: Optional[str] = None,
+                          metadata_update: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         now = utc_now()
         fields: Dict[str, Any] = {
             "status": status,
             "updated_at": now,
         }
+        if environment_id is not None:
+            fields["environment_id"] = environment_id
         if status == "deploying":
             fields["started_at"] = now
         if status in QUEUE_TERMINAL_STATUSES:
@@ -442,6 +539,11 @@ class LeaseManager:
             fields["lease_id"] = lease_id
         if error is not None:
             fields["error_json"] = json.dumps(error, sort_keys=True)
+        if metadata_update is not None:
+            current = self._queue_row(queue_id) or {}
+            metadata = dict(current.get("metadata") or {})
+            metadata.update(metadata_update)
+            fields["metadata_json"] = json.dumps(metadata, sort_keys=True)
         assignments = ", ".join(f"{key} = ?" for key in fields)
         self.conn.execute(f"UPDATE deploy_queue SET {assignments} WHERE id = ?", (*fields.values(), queue_id))
         return self._queue_row(queue_id) or {"id": queue_id, "status": status}
@@ -565,6 +667,7 @@ class LeaseManager:
                 "message": "AGENT_HQ_MCP_API_KEY is required in the lease manager MCP server env when Agent HQ callbacks are configured.",
                 "environment_id": environment_id,
             }
+        queue_metadata = self._request_metadata(env, environment_id, source_repo_path, extra=metadata)
         superseded: list[Dict[str, Any]] = []
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -572,12 +675,11 @@ class LeaseManager:
                 """
                 SELECT *
                 FROM deploy_queue
-                WHERE environment_id = ?
-                  AND task_id = ?
+                WHERE task_id = ?
                   AND status = 'queued'
                 ORDER BY requested_at ASC
                 """,
-                (environment_id, str(task_id)),
+                (str(task_id),),
             ).fetchall()
             for row in existing_rows:
                 old = row_to_dict(row)
@@ -617,7 +719,7 @@ class LeaseManager:
                     resolved_callback_api_key,
                     now,
                     now,
-                    json.dumps(metadata or {}, sort_keys=True),
+                    json.dumps(queue_metadata, sort_keys=True),
                 ),
             )
             self.conn.execute("COMMIT")
@@ -974,20 +1076,63 @@ class LeaseManager:
             return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
         if not os.path.isdir(source_repo_path):
             return {"ok": False, "error": "source_repo_path_not_found", "source_repo_path": source_repo_path}
+        target_env = env
+        target_environment_id = environment_id
         acquire = self.acquire(
-            environment_id,
+            target_environment_id,
             task_id,
             actor,
             agent_id,
             agent_name,
             branch,
             commit,
-            {"source_repo_path": source_repo_path},
+            self._request_metadata(
+                env,
+                environment_id,
+                source_repo_path,
+                assigned_environment_id=target_environment_id,
+            ),
             supersede_same_task_review=True,
         )
         superseded_lease = acquire.get("superseded_lease")
-        if not acquire.get("ok"):
-            if queue_if_busy and acquire.get("error") == "environment_busy":
+        if not acquire.get("ok") and queue_if_busy and acquire.get("error") == "environment_busy":
+            queued_because_owner = acquire.get("owner")
+            available_env = self._available_environment_for_request(environment_id)
+            if available_env:
+                target_env = available_env
+                target_environment_id = str(available_env["id"])
+                acquire = self.acquire(
+                    target_environment_id,
+                    task_id,
+                    actor,
+                    agent_id,
+                    agent_name,
+                    branch,
+                    commit,
+                    self._request_metadata(
+                        env,
+                        environment_id,
+                        source_repo_path,
+                        assigned_environment_id=target_environment_id,
+                        extra={"selected_after_busy_owner": queued_because_owner},
+                    ),
+                    supersede_same_task_review=True,
+                )
+                superseded_lease = acquire.get("superseded_lease")
+                if acquire.get("ok"):
+                    acquire["requested_environment_id"] = environment_id
+                    acquire["assigned_environment_id"] = target_environment_id
+                elif acquire.get("error") != "environment_busy":
+                    if superseded_lease:
+                        acquire["superseded_lease"] = superseded_lease
+                    return acquire
+            if not acquire.get("ok"):
+                if acquire.get("error") == "environment_busy" and not queued_because_owner:
+                    queued_because_owner = acquire.get("owner")
+                metadata = {"queued_because_owner": queued_because_owner}
+                if target_environment_id != environment_id:
+                    metadata["alternate_busy_owner"] = acquire.get("owner")
+                    metadata["attempted_assignment_environment_id"] = target_environment_id
                 return self.enqueue_deploy_request(
                     environment_id,
                     task_id,
@@ -1002,8 +1147,9 @@ class LeaseManager:
                     priority=priority,
                     callback_url=callback_url,
                     callback_api_key=callback_api_key,
-                    metadata={"queued_because_owner": acquire.get("owner")},
+                    metadata=metadata,
                 )
+        if not acquire.get("ok"):
             if superseded_lease:
                 acquire["superseded_lease"] = superseded_lease
             return acquire
@@ -1015,9 +1161,9 @@ class LeaseManager:
             return deploying
 
         deployed = self._deploy_acquired_lease(
-            env,
+            target_env,
             lease_id,
-            environment_id,
+            target_environment_id,
             task_id,
             actor,
             source_repo_path,
@@ -1029,21 +1175,28 @@ class LeaseManager:
         )
         if superseded_lease:
             deployed["superseded_lease"] = superseded_lease
+        if target_environment_id != environment_id:
+            deployed["requested_environment_id"] = environment_id
+            deployed["assigned_environment_id"] = target_environment_id
         return deployed
 
     def _next_queued_request(self, environment_id: str) -> Optional[Dict[str, Any]]:
-        row = self.conn.execute(
+        env = self._environment(environment_id)
+        if not env:
+            return None
+        rows = self.conn.execute(
             """
             SELECT *
             FROM deploy_queue
-            WHERE environment_id = ?
-              AND status = 'queued'
+            WHERE status = 'queued'
             ORDER BY priority DESC, requested_at ASC, id ASC
-            LIMIT 1
             """,
-            (environment_id,),
-        ).fetchone()
-        return row_to_dict(row)
+        ).fetchall()
+        for row in rows:
+            queue = row_to_dict(row)
+            if queue and self._queue_matches_environment(queue, env):
+                return queue
+        return None
 
     def sweep_deploy_queue(self, actor: str, environment_id: Optional[str] = None,
                            limit: int = 1, dry_run: bool = False,
@@ -1093,7 +1246,17 @@ class LeaseManager:
                 continue
 
             lease = acquire["lease"]
-            queue = self._set_queue_status(queue["id"], "deploying", lease_id=lease["id"])
+            requested_environment_id = self._queue_requested_environment_id(queue)
+            queue = self._set_queue_status(
+                queue["id"],
+                "deploying",
+                lease_id=lease["id"],
+                environment_id=str(env_id),
+                metadata_update={
+                    "requested_environment_id": requested_environment_id,
+                    "assigned_environment_id": str(env_id),
+                },
+            )
             callbacks = [
                 self._send_callback(
                     queue,

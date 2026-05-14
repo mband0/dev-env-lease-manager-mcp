@@ -47,14 +47,20 @@ If the tool returns `environment_busy`, the agent posts blocked/waiting with the
 owner task, lease id, branch, and commit from the response. The agent must not
 fall back to manual shared-checkout mutation.
 
-If `queue_if_busy` is true and the environment is busy, the tool returns
-`status: queued` with a queue id and position. This is an expected workflow
-state, not a blocked task state. The queue worker command/tool
-`sweep-deploy-queue` / `dev_env_sweep_deploy_queue` deploys the exact recorded
-commit once the environment is available. New queued requests for the same task
-supersede older queued requests so stale commits do not deploy later.
+If `queue_if_busy` is true, `environment_id` is treated as the preferred target
+for that deployment pool. When the preferred environment is busy and another
+configured environment has the same selector tags, the lease manager assigns the
+deploy to the next available matching environment immediately. If all matching
+environments are busy, the tool returns `status: queued` with a queue id,
+position, `requested_environment_id`, and empty `assigned_environment_id`. This
+is an expected workflow state, not a blocked task state. The queue worker
+command/tool `sweep-deploy-queue` / `dev_env_sweep_deploy_queue` deploys the
+exact recorded commit on the next available matching environment. New queued
+requests for the same task supersede older queued requests so stale commits do
+not deploy later.
 
-Normal lease release also sweeps the next queued deploy for that environment.
+Normal lease release also sweeps the next queued deploy that can run on the
+released environment.
 Callers may still run `sweep-deploy-queue` manually for recovery or operator
 maintenance, but the expected path is that releasing the active lease promotes
 the next queued request automatically.

@@ -24,6 +24,27 @@
         "pm2_api": "agent-hq-dev-api",
         "pm2_ui": "agent-hq-dev-ui"
       }
+    },
+    {
+      "id": "agent-hq-dev-2",
+      "label": "Agent HQ Dev 2",
+      "base_url": "http://127.0.0.1:3520",
+      "health_url": "http://127.0.0.1:3521/health",
+      "repo_path": "~/agent-hq-dev-2",
+      "deploy_command": "~/agent-hq/scripts/capability-tools/deploy_dev_worktree.sh",
+      "served_commit_command": "git -C ~/agent-hq-dev-2 rev-parse HEAD",
+      "stale_after_seconds": 7200,
+      "tags": ["agent-hq", "dev", "shared-checkout"],
+      "metadata": {
+        "deploy_mode": "native",
+        "canonical_root": "~/agent-hq",
+        "state_dir": "~/.agent-hq-dev-2-deploy",
+        "api_port": 3521,
+        "ui_port": 3520,
+        "pm2_api": "agent-hq-dev-2-api",
+        "pm2_ui": "agent-hq-dev-2-ui",
+        "dev_db_path": "~/agent-hq-dev-2/agent-hq-dev-2.db"
+      }
     }
   ]
 }

@@ -16,24 +16,26 @@ class ManagerTestCase(unittest.TestCase):
     def make_manager(self, stale_after_seconds: int = 3600, deploy_command: str | None = None,
                      served_commit_command: str | None = None,
                      metadata: dict[str, object] | None = None,
-                     agent_hq: dict[str, object] | None = None) -> tuple[LeaseManager, tempfile.TemporaryDirectory[str]]:
+                     agent_hq: dict[str, object] | None = None,
+                     environment_tags: list[str] | None = None,
+                     extra_environments: list[dict[str, object]] | None = None) -> tuple[LeaseManager, tempfile.TemporaryDirectory[str]]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        environment = {
+            "id": "agent-hq-dev",
+            "label": "Agent HQ Dev",
+            "base_url": "http://127.0.0.1:3510",
+            "repo_path": str(Path(tmp.name) / "dev"),
+            "stale_after_seconds": stale_after_seconds,
+            "deploy_command": deploy_command,
+            "served_commit_command": served_commit_command,
+            "tags": environment_tags or [],
+            "metadata": metadata or {},
+        }
         payload = {
             "data_path": str(Path(tmp.name) / "state.sqlite3"),
             "agent_hq": agent_hq or {},
-            "environments": [
-                {
-                    "id": "agent-hq-dev",
-                    "label": "Agent HQ Dev",
-                    "base_url": "http://127.0.0.1:3510",
-                    "repo_path": str(Path(tmp.name) / "dev"),
-                    "stale_after_seconds": stale_after_seconds,
-                    "deploy_command": deploy_command,
-                    "served_commit_command": served_commit_command,
-                    "metadata": metadata or {},
-                }
-            ],
+            "environments": [environment, *(extra_environments or [])],
         }
         config_path = Path(tmp.name) / "envs.json"
         config_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -227,6 +229,82 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertEqual(status["active_lease"]["id"], active["id"])
         self.assertEqual(status["queue_depth"], 1)
         self.assertEqual(status["queue"][0]["commit_sha"], "queued-commit")
+
+    def test_lease_aware_deploy_uses_next_available_matching_environment(self) -> None:
+        manager, tmp = self.make_manager(
+            environment_tags=["agent-hq", "dev", "shared-checkout"],
+            extra_environments=[{
+                "id": "agent-hq-dev-2",
+                "label": "Agent HQ Dev 2",
+                "base_url": "http://127.0.0.1:3520",
+                "stale_after_seconds": 3600,
+                "tags": ["agent-hq", "dev", "shared-checkout"],
+            }],
+        )
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        active = manager.acquire("agent-hq-dev", "425", "anchor", commit="active")["lease"]
+
+        result = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "426",
+            "cinder",
+            str(source),
+            branch="task-426",
+            commit="deploy-commit",
+            dry_run=True,
+            queue_if_busy=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "deployed_for_qa")
+        self.assertEqual(result["requested_environment_id"], "agent-hq-dev")
+        self.assertEqual(result["assigned_environment_id"], "agent-hq-dev-2")
+        self.assertEqual(result["lease"]["environment_id"], "agent-hq-dev-2")
+        by_env = {item["environment"]["id"]: item for item in manager.status()["environments"]}
+        self.assertEqual(by_env["agent-hq-dev"]["active_lease"]["id"], active["id"])
+        self.assertEqual(by_env["agent-hq-dev-2"]["active_lease"]["task_id"], "426")
+        self.assertEqual(by_env["agent-hq-dev-2"]["active_lease"]["commit_sha"], "deploy-commit")
+
+    def test_sweep_deploy_queue_assigns_queued_request_to_matching_available_environment(self) -> None:
+        manager, tmp = self.make_manager(
+            environment_tags=["agent-hq", "dev", "shared-checkout"],
+            extra_environments=[{
+                "id": "agent-hq-dev-2",
+                "label": "Agent HQ Dev 2",
+                "base_url": "http://127.0.0.1:3520",
+                "stale_after_seconds": 3600,
+                "tags": ["agent-hq", "dev", "shared-checkout"],
+            }],
+        )
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        manager.acquire("agent-hq-dev", "425", "anchor", commit="active")
+        active_dev_2 = manager.acquire("agent-hq-dev-2", "426", "prism", commit="active-2")["lease"]
+        queued = manager.lease_aware_deploy(
+            "agent-hq-dev",
+            "427",
+            "cinder",
+            str(source),
+            branch="task-427",
+            commit="queued-commit",
+            dry_run=True,
+            queue_if_busy=True,
+        )["queue"]
+        manager.force_release("operator", "free alternate", lease_id=active_dev_2["id"], sweep_queue_after_release=False)
+
+        result = manager.sweep_deploy_queue("queue-worker", environment_id="agent-hq-dev-2", dry_run=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["processed"]), 1)
+        processed = result["processed"][0]
+        self.assertEqual(processed["queue"]["id"], queued["id"])
+        self.assertEqual(processed["queue"]["requested_environment_id"], "agent-hq-dev")
+        self.assertEqual(processed["queue"]["assigned_environment_id"], "agent-hq-dev-2")
+        self.assertEqual(processed["queue"]["environment_id"], "agent-hq-dev-2")
+        lease = manager.status("agent-hq-dev-2")["environments"][0]["active_lease"]
+        self.assertEqual(lease["task_id"], "427")
+        self.assertEqual(lease["commit_sha"], "queued-commit")
 
     def test_queue_status_reports_current_busy_owner_from_active_lease(self) -> None:
         manager, tmp = self.make_manager()
