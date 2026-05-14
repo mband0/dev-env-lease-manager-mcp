@@ -297,6 +297,7 @@ class NativeDevDeployer:
                 self._run(["pm2", "delete", ui_name], timeout=60, check=False)
                 ui_env = os.environ.copy()
                 ui_env.update({
+                    "PORT": ui_port,
                     "AGENT_HQ_INTERNAL_BASE_URL": f"http://localhost:{api_port}",
                     "NEXT_PUBLIC_API_URL": f"http://localhost:{api_port}",
                 })

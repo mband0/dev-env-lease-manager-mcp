@@ -28,12 +28,14 @@ class NativeDeployTests(unittest.TestCase):
             write_package(repo / "ui/package.json", {"build": "next build", "start-dev": "next start"})
         return tmp, source, dev, canonical
 
-    def fake_runner(self, source: Path, dev: Path, commands: list[list[str]]):
+    def fake_runner(self, source: Path, dev: Path, commands: list[list[str]], command_envs: list[tuple[list[str], dict[str, str]]] | None = None):
         source_path = str(source.resolve())
         dev_path = str(dev.resolve())
 
         def run(args, cwd=None, env=None, text=True, capture_output=True, timeout=None):
             commands.append(list(args))
+            if command_envs is not None:
+                command_envs.append((list(args), dict(env or {})))
             stdout = ""
             returncode = 0
             if args[:4] == ["git", "-C", source_path, "rev-parse"] and args[4:] == ["--show-toplevel"]:
@@ -80,7 +82,8 @@ class NativeDeployTests(unittest.TestCase):
     def test_native_deploy_promotes_exact_head_and_restarts_services(self) -> None:
         _, source, dev, canonical = self.make_layout()
         commands: list[list[str]] = []
-        deployer = NativeDevDeployer(self.fake_runner(source, dev, commands))
+        command_envs: list[tuple[list[str], dict[str, str]]] = []
+        deployer = NativeDevDeployer(self.fake_runner(source, dev, commands, command_envs))
         state_dir = Path(source.parent) / "state"
 
         result = deployer.deploy(
@@ -110,6 +113,13 @@ class NativeDeployTests(unittest.TestCase):
         self.assertIn(["npm", "run", "build"], commands)
         self.assertIn(["pm2", "start", "npm", "--name", "agent-hq-dev-api", "--cwd", str(dev.resolve() / "api"), "--", "start"], commands)
         self.assertIn(["pm2", "start", "npm", "--name", "agent-hq-dev-ui", "--cwd", str(dev.resolve() / "ui"), "--", "run", "start-dev"], commands)
+        ui_start_env = next(
+            env for command, env in command_envs
+            if command == ["pm2", "start", "npm", "--name", "agent-hq-dev-ui", "--cwd", str(dev.resolve() / "ui"), "--", "run", "start-dev"]
+        )
+        self.assertEqual(ui_start_env["PORT"], "3510")
+        self.assertEqual(ui_start_env["AGENT_HQ_INTERNAL_BASE_URL"], "http://localhost:3511")
+        self.assertEqual(ui_start_env["NEXT_PUBLIC_API_URL"], "http://localhost:3511")
 
         state = json.loads((state_dir / "current-target.json").read_text(encoding="utf-8"))
         self.assertEqual(state["current"]["source_sha"], "abc123")
