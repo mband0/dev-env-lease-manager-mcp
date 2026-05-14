@@ -68,14 +68,28 @@ class NativeDevDeployer:
         timeout: int = 1800,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        completed = self.runner(
-            args,
-            cwd=cwd,
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-        )
+        try:
+            completed = self.runner(
+                args,
+                cwd=cwd,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            raise NativeDeployError(
+                "command_timed_out",
+                {
+                    "command": args,
+                    "cwd": cwd,
+                    "timeout_seconds": timeout,
+                    "stdout": stdout[-4000:],
+                    "stderr": stderr[-4000:],
+                },
+            )
         if check and completed.returncode != 0:
             raise NativeDeployError(
                 "command_failed",
@@ -147,17 +161,27 @@ class NativeDevDeployer:
         if not (Path(package_dir) / "node_modules").is_dir():
             self._run(["npm", "install", "--production=false"], cwd=package_dir)
 
-    def _check_dev_clean(self, dev_repo_path: str) -> None:
+    def _prepare_dev_checkout(self, dev_repo_path: str, timeout_seconds: int) -> Dict[str, Any]:
+        status = self._git(dev_repo_path, "status", "--porcelain=v1", "--untracked-files=all").stdout.strip()
         diff = self._git(dev_repo_path, "diff", "--quiet", check=False)
         staged = self._git(dev_repo_path, "diff", "--cached", "--quiet", check=False)
-        if diff.returncode != 0 or staged.returncode != 0:
-            raise NativeDeployError("dev repo has tracked modifications; clean or commit it before promotion")
-        untracked = self._git(dev_repo_path, "ls-files", "--others", "--exclude-standard").stdout.strip()
+        tracked_dirty = diff.returncode != 0 or staged.returncode != 0
+        untracked = self._git(dev_repo_path, "ls-files", "--others", "--exclude-standard").stdout.strip().splitlines()
+        cleanup: Dict[str, Any] = {
+            "cleaned": False,
+            "tracked_dirty": tracked_dirty,
+            "untracked_files": untracked,
+            "status": status.splitlines() if status else [],
+        }
+        if tracked_dirty:
+            reset = self._git(dev_repo_path, "reset", "--hard", timeout=timeout_seconds)
+            cleanup["cleaned"] = True
+            cleanup["reset_stdout"] = reset.stdout[-1000:]
         if untracked:
-            raise NativeDeployError(
-                "dev repo has untracked non-ignored files; remove or ignore them before promotion",
-                {"files": untracked.splitlines()},
-            )
+            clean = self._git(dev_repo_path, "clean", "-ffd", timeout=timeout_seconds)
+            cleanup["cleaned"] = True
+            cleanup["clean_stdout"] = clean.stdout[-1000:]
+        return cleanup
 
     def _health_check(self, services: Iterable[str], api_port: str, ui_port: str) -> Dict[str, Dict[str, Any]]:
         checks = []
@@ -249,6 +273,7 @@ class NativeDevDeployer:
             if not Path(dev_repo_path).is_dir():
                 raise NativeDeployError("dev_repo_path is not a directory")
             self._git(dev_repo_path, "rev-parse", "--show-toplevel")
+            dev_predeploy_cleanup = self._prepare_dev_checkout(dev_repo_path, timeout_seconds)
 
             for relative_path in ("agent-hq-dev.db", ".env", ".env.local", "api/.env", "api/.env.local", "ui/.env", "ui/.env.local"):
                 self._copy_if_missing(canonical_root, dev_repo_path, relative_path)
@@ -257,7 +282,6 @@ class NativeDevDeployer:
             self._require_file(str(Path(dev_repo_path) / "api/package.json"), "dev repo api/package.json missing")
             self._require_file(str(Path(dev_repo_path) / "ui/package.json"), "dev repo ui/package.json missing")
             self._ensure_package_scripts(dev_repo_path)
-            self._check_dev_clean(dev_repo_path)
 
             previous_dev_sha = self._git(dev_repo_path, "rev-parse", "HEAD", check=False).stdout.strip() or None
             previous_api = self._capture_pm2(api_name)
@@ -318,6 +342,7 @@ class NativeDevDeployer:
                     "services": service_list,
                     "api": {"cwd": f"{dev_repo_path}/api", "name": api_name, "args": ["start"]},
                     "ui": {"cwd": f"{dev_repo_path}/ui", "name": ui_name, "args": ["run", "start-dev"]},
+                    "dev_predeploy_cleanup": dev_predeploy_cleanup,
                 },
             }
             Path(state_file).parent.mkdir(parents=True, exist_ok=True)
@@ -331,6 +356,7 @@ class NativeDevDeployer:
                 "dev_repo_path": dev_repo_path,
                 "state_file": state_file,
                 "services": service_list,
+                "dev_predeploy_cleanup": dev_predeploy_cleanup,
                 "health": health,
             }
         finally:

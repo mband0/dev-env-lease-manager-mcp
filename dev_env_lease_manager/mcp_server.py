@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import traceback
 from typing import Any, Callable, Dict, Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from .config import default_config_path, load_config
 from .manager import LeaseManager
+
+DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS = 170
 
 
 class LeaseManagerMcpTools:
@@ -65,6 +68,7 @@ class LeaseManagerMcpTools:
                 a.get("environment_id"),
                 int(a.get("limit") or 1),
                 bool(a.get("dry_run", False)),
+                int(a.get("timeout_seconds") or DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS),
             ),
             "dev_env_cancel_queue": lambda a: self.manager.cancel_queue_request(
                 a["queue_id"],
@@ -101,6 +105,7 @@ class LeaseManagerMcpTools:
                 priority=int(a.get("priority") or 0),
                 callback_url=a.get("callback_url"),
                 callback_api_key=a.get("callback_api_key"),
+                timeout_seconds=int(a.get("timeout_seconds") or DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS),
             ),
         }
         if name not in handlers:
@@ -109,6 +114,16 @@ class LeaseManagerMcpTools:
             return handlers[name](args or {})
         except KeyError as exc:
             return {"ok": False, "error": "missing_required_argument", "argument": str(exc).strip("'")}
+        except Exception as exc:
+            formatted_traceback = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            return {
+                "ok": False,
+                "error": "tool_call_failed",
+                "tool": name,
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": formatted_traceback[-4000:],
+            }
 
 
 def create_mcp_server(manager: LeaseManager) -> FastMCP:
@@ -281,6 +296,7 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
         environment_id: Optional[str] = None,
         limit: int = 1,
         dry_run: bool = False,
+        timeout_seconds: int = DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS,
     ) -> Dict[str, Any]:
         """Deploy queued requests for available environments."""
         return service.call_tool("dev_env_sweep_deploy_queue", {
@@ -288,6 +304,7 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
             "environment_id": environment_id,
             "limit": limit,
             "dry_run": dry_run,
+            "timeout_seconds": timeout_seconds,
         })
 
     @mcp.tool()
@@ -357,8 +374,14 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
         priority: int = 0,
         callback_url: Optional[str] = None,
         callback_api_key: Optional[str] = None,
+        timeout_seconds: int = DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS,
     ) -> Dict[str, Any]:
-        """Lease-aware deploy wrapper around the configured deploy command."""
+        """Lease-aware deploy wrapper around the configured deploy command.
+
+        The MCP default deploy timeout is slightly below OpenClaw's 3-minute
+        tool boundary so agents receive a structured deploy error instead of a
+        generic MCP request timeout.
+        """
         return service.call_tool("dev_env_deploy_worktree", {
             "environment_id": environment_id,
             "task_id": task_id,
@@ -375,6 +398,7 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
             "priority": priority,
             "callback_url": callback_url,
             "callback_api_key": callback_api_key,
+            "timeout_seconds": timeout_seconds,
         })
 
     return mcp

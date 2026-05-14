@@ -519,6 +519,67 @@ class LeaseManager:
             )
             return {"ok": False, "error": str(exc), "payload": payload, "attempt_id": attempt_id}
 
+    def _direct_deploy_callback_queue(self, *, environment_id: str, requested_environment_id: str,
+                                      task_id: str, lease_id: str, agent_id: Optional[str],
+                                      agent_name: Optional[str], branch: Optional[str],
+                                      commit: Optional[str], source_repo_path: str,
+                                      callback_url: Optional[str],
+                                      callback_api_key: Optional[str]) -> Dict[str, Any]:
+        return {
+            "id": lease_id,
+            "environment_id": environment_id,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "branch": branch,
+            "commit_sha": commit,
+            "source_repo_path": source_repo_path,
+            "status": "deploying",
+            "callback_url": callback_url,
+            "callback_api_key": callback_api_key,
+            "metadata": {
+                "requested_environment_id": requested_environment_id,
+                "assigned_environment_id": environment_id,
+                "direct_deploy": True,
+            },
+        }
+
+    def _deploy_failure_summary(self, result: Dict[str, Any]) -> str:
+        deploy = result.get("deploy") if isinstance(result.get("deploy"), dict) else {}
+        error = (
+            deploy.get("error")
+            or result.get("error")
+            or result.get("message")
+            or result.get("release_reason")
+            or "deploy failed"
+        )
+        details: list[str] = []
+        health = deploy.get("health")
+        if isinstance(health, dict):
+            for name, value in sorted(health.items()):
+                if not isinstance(value, dict):
+                    continue
+                status = "ok" if value.get("ok") else "failed"
+                detail = value.get("detail")
+                url = value.get("url")
+                if detail is not None and url:
+                    details.append(f"{name} {status} at {url}: {detail}")
+                elif detail is not None:
+                    details.append(f"{name} {status}: {detail}")
+                else:
+                    details.append(f"{name} {status}")
+        elif deploy.get("stderr"):
+            stderr_lines = str(deploy.get("stderr")).strip().splitlines()
+            if stderr_lines:
+                details.append(stderr_lines[-1])
+        elif deploy.get("stdout"):
+            stdout_lines = str(deploy.get("stdout")).strip().splitlines()
+            if stdout_lines:
+                details.append(stdout_lines[-1])
+        if details:
+            return f"{error} ({'; '.join(detail for detail in details if detail)})"
+        return str(error)
+
     def _set_queue_status(self, queue_id: str, status: str, *,
                           lease_id: Optional[str] = None,
                           error: Optional[Dict[str, Any]] = None,
@@ -1155,10 +1216,39 @@ class LeaseManager:
             return acquire
         lease_id = acquire["lease"]["id"]
         deploying = self.transition(lease_id, "mark_deploying", actor)
+        callback_queue = self._direct_deploy_callback_queue(
+            environment_id=target_environment_id,
+            requested_environment_id=environment_id,
+            task_id=task_id,
+            lease_id=lease_id,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            branch=branch,
+            commit=commit,
+            source_repo_path=source_repo_path,
+            callback_url=callback_url,
+            callback_api_key=callback_api_key,
+        )
+        callbacks: list[Dict[str, Any]] = []
         if not deploying.get("ok"):
+            error = {"stage": "mark_deploying", "result": deploying}
+            callbacks.append(self._send_callback(
+                callback_queue,
+                "deploy_failed",
+                f"Direct deploy lease {lease_id} failed before deployment.",
+                lease=acquire.get("lease"),
+                error=error,
+            ))
+            deploying["callbacks"] = callbacks
             if superseded_lease:
                 deploying["superseded_lease"] = superseded_lease
             return deploying
+        callbacks.append(self._send_callback(
+            callback_queue,
+            "dev_deploying",
+            f"Direct deploy lease {lease_id} is deploying to {target_environment_id}.",
+            lease=deploying.get("lease") or acquire.get("lease"),
+        ))
 
         deployed = self._deploy_acquired_lease(
             target_env,
@@ -1173,6 +1263,25 @@ class LeaseManager:
             dry_run,
             timeout_seconds,
         )
+        latest_lease = self._lease(lease_id) or acquire.get("lease")
+        if deployed.get("status") == "deployed_for_qa":
+            callbacks.append(self._send_callback(
+                callback_queue,
+                "deployed_for_qa",
+                f"Direct deploy lease {lease_id} completed and is ready for QA.",
+                lease=latest_lease,
+            ))
+        else:
+            error = {"stage": "deploy", "result": deployed}
+            failure_summary = self._deploy_failure_summary(deployed)
+            callbacks.append(self._send_callback(
+                callback_queue,
+                "deploy_failed",
+                f"Direct deploy lease {lease_id} failed: {failure_summary}.",
+                lease=latest_lease,
+                error=error,
+            ))
+        deployed["callbacks"] = callbacks
         if superseded_lease:
             deployed["superseded_lease"] = superseded_lease
         if target_environment_id != environment_id:
@@ -1305,11 +1414,12 @@ class LeaseManager:
                 ))
             else:
                 error = {"stage": "deploy", "result": result}
+                failure_summary = self._deploy_failure_summary(result)
                 final_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
                 callbacks.append(self._send_callback(
                     final_queue,
                     "deploy_failed",
-                    f"Queued deploy {queue['id']} failed.",
+                    f"Queued deploy {queue['id']} failed: {failure_summary}.",
                     lease=latest_lease,
                     error=error,
                 ))
@@ -1341,15 +1451,27 @@ class LeaseManager:
             proc_env["dev_repo_path"] = env["repo_path"]
             proc_env["DEV_REPO_PATH"] = env["repo_path"]
 
-        completed = subprocess.run(
-            command if isinstance(command, str) else shlex.join(command),
-            shell=True,
-            cwd=source_repo_path,
-            env=proc_env,
-            text=True,
-            capture_output=True,
-            timeout=timeout_seconds,
-        )
+        try:
+            completed = subprocess.run(
+                command if isinstance(command, str) else shlex.join(command),
+                shell=True,
+                cwd=source_repo_path,
+                env=proc_env,
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            return {
+                "ok": False,
+                "mode": "command",
+                "error": "command_timed_out",
+                "timeout_seconds": timeout_seconds,
+                "stdout": stdout[-4000:],
+                "stderr": stderr[-4000:],
+            }
         return {
             "ok": completed.returncode == 0,
             "mode": "command",

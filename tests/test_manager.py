@@ -630,6 +630,92 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertEqual(captured_urls[0], "http://agent-hq.local/api/v1/external/task-events")
         self.assertEqual(captured_headers[0]["x-api-key"], "agent-key")
 
+    def test_direct_deploy_callbacks_include_agent_hq_event_payloads(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        captured_events: list[dict[str, object]] = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok":true}'
+
+        def fake_urlopen(request, timeout=15):
+            captured_events.append(json.loads(request.data.decode("utf-8")))
+            return Response()
+
+        with patch("dev_env_lease_manager.manager.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = manager.lease_aware_deploy(
+                "agent-hq-dev",
+                "426",
+                "cinder",
+                str(source),
+                branch="task-426",
+                commit="direct-commit",
+                dry_run=True,
+                callback_url="http://agent-hq.local",
+                callback_api_key="test-key",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([event["event"] for event in captured_events], ["dev_deploying", "deployed_for_qa"])
+        self.assertTrue(all(event["source"] == "dev_environment_lease_manager" for event in captured_events))
+        self.assertTrue(all(event["task_id"] == "426" for event in captured_events))
+        self.assertTrue(all(event["queue_id"] == result["lease"]["id"] for event in captured_events))
+        self.assertTrue(all(event["lease_id"] == result["lease"]["id"] for event in captured_events))
+        self.assertTrue(all(event["environment_id"] == "agent-hq-dev" for event in captured_events))
+        self.assertTrue(all(event["assigned_environment_id"] == "agent-hq-dev" for event in captured_events))
+        self.assertTrue(all(event["requested_environment_id"] == "agent-hq-dev" for event in captured_events))
+        attempts = list(reversed(manager.callback_attempts(lease_id=result["lease"]["id"], limit=10)["callback_attempts"]))
+        self.assertEqual([attempt["event"] for attempt in attempts], ["dev_deploying", "deployed_for_qa"])
+
+    def test_direct_deploy_failure_callback_includes_error_summary(self) -> None:
+        manager, tmp = self.make_manager(deploy_command="python3 -c 'import sys; sys.exit(3)'")
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        captured_events: list[dict[str, object]] = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok":true}'
+
+        def fake_urlopen(request, timeout=15):
+            captured_events.append(json.loads(request.data.decode("utf-8")))
+            return Response()
+
+        with patch("dev_env_lease_manager.manager.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = manager.lease_aware_deploy(
+                "agent-hq-dev",
+                "426",
+                "cinder",
+                str(source),
+                callback_url="http://agent-hq.local",
+                callback_api_key="test-key",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["release_reason"], "deploy_failed")
+        self.assertEqual([event["event"] for event in captured_events], ["dev_deploying", "deploy_failed"])
+        self.assertIn("failed:", captured_events[-1]["message"])
+        self.assertEqual(captured_events[-1]["error"]["stage"], "deploy")
+        self.assertEqual(captured_events[-1]["error"]["result"]["deploy"]["returncode"], 3)
+
     def test_queue_requires_agent_api_key_when_callbacks_are_configured(self) -> None:
         manager, tmp = self.make_manager(agent_hq={
             "base_url": "http://agent-hq.local",
@@ -695,6 +781,18 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["release_reason"], "deploy_failed")
         self.assertTrue(manager.status()["environments"][0]["available"])
+
+    def test_command_deploy_timeout_returns_structured_error(self) -> None:
+        manager, tmp = self.make_manager(deploy_command="python3 -c 'import time; time.sleep(2)'")
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+
+        result = manager.lease_aware_deploy("agent-hq-dev", "426", "cinder", str(source), timeout_seconds=1)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["release_reason"], "deploy_failed")
+        self.assertEqual(result["deploy"]["error"], "command_timed_out")
+        self.assertEqual(result["deploy"]["timeout_seconds"], 1)
 
     def test_lease_aware_deploy_uses_native_mcp_deploy_when_configured(self) -> None:
         manager, tmp = self.make_manager(
