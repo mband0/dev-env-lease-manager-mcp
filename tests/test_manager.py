@@ -765,6 +765,9 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertIn("failed:", captured_events[-1]["message"])
         self.assertEqual(captured_events[-1]["error"]["stage"], "deploy")
         self.assertEqual(captured_events[-1]["error"]["result"]["deploy"]["returncode"], 3)
+        self.assertEqual(result["callbacks"][-1]["payload"]["error"]["result"]["deploy"]["returncode"], 3)
+        self.assertNotIn("callbacks", result["callbacks"][-1]["payload"]["error"]["result"])
+        json.dumps(result, sort_keys=True)
 
     def test_queue_requires_agent_api_key_when_callbacks_are_configured(self) -> None:
         manager, tmp = self.make_manager(agent_hq={

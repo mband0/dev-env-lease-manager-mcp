@@ -581,6 +581,42 @@ class LeaseManager:
             return f"{error} ({'; '.join(detail for detail in details if detail)})"
         return str(error)
 
+    def _json_safe_callback_value(self, value: Any, seen: Optional[set[int]] = None) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if seen is None:
+            seen = set()
+
+        value_id = id(value)
+        if value_id in seen:
+            return "<circular-reference>"
+
+        if isinstance(value, dict):
+            seen.add(value_id)
+            try:
+                return {
+                    str(key): self._json_safe_callback_value(item, seen)
+                    for key, item in value.items()
+                    if key != "callbacks"
+                }
+            finally:
+                seen.remove(value_id)
+
+        if isinstance(value, (list, tuple, set)):
+            seen.add(value_id)
+            try:
+                return [self._json_safe_callback_value(item, seen) for item in value]
+            finally:
+                seen.remove(value_id)
+
+        return str(value)
+
+    def _callback_error(self, stage: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "stage": stage,
+            "result": self._json_safe_callback_value(result),
+        }
+
     def _set_queue_status(self, queue_id: str, status: str, *,
                           lease_id: Optional[str] = None,
                           error: Optional[Dict[str, Any]] = None,
@@ -1235,7 +1271,7 @@ class LeaseManager:
         )
         callbacks: list[Dict[str, Any]] = []
         if not deploying.get("ok"):
-            error = {"stage": "mark_deploying", "result": deploying}
+            error = self._callback_error("mark_deploying", deploying)
             callbacks.append(self._send_callback(
                 callback_queue,
                 "deploy_failed",
@@ -1276,7 +1312,7 @@ class LeaseManager:
                 lease=latest_lease,
             ))
         else:
-            error = {"stage": "deploy", "result": deployed}
+            error = self._callback_error("deploy", deployed)
             failure_summary = self._deploy_failure_summary(deployed)
             callbacks.append(self._send_callback(
                 callback_queue,
@@ -1381,7 +1417,7 @@ class LeaseManager:
 
             deploying = self.transition(lease["id"], "mark_deploying", actor)
             if not deploying.get("ok"):
-                error = {"stage": "mark_deploying", "result": deploying}
+                error = self._callback_error("mark_deploying", deploying)
                 failed_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
                 callbacks.append(self._send_callback(
                     failed_queue,
@@ -1417,7 +1453,7 @@ class LeaseManager:
                     lease=latest_lease,
                 ))
             else:
-                error = {"stage": "deploy", "result": result}
+                error = self._callback_error("deploy", result)
                 failure_summary = self._deploy_failure_summary(result)
                 final_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
                 callbacks.append(self._send_callback(
