@@ -401,6 +401,7 @@ class LeaseManager:
         callback_url = self._callback_url(queue.get("callback_url"))
         env = self._environment(str(queue["environment_id"])) or {}
         lease_id = (lease or {}).get("id") or queue.get("lease_id") or queue["id"]
+        commit_sha = queue.get("commit_sha") or (lease or {}).get("commit_sha")
         metadata = queue.get("metadata") or {}
         requested_environment_id = metadata.get("requested_environment_id")
         assigned_environment_id = metadata.get("assigned_environment_id")
@@ -414,7 +415,7 @@ class LeaseManager:
             "queue_id": queue["id"],
             "lease_id": lease_id,
             "branch": queue.get("branch"),
-            "commit_sha": queue.get("commit_sha"),
+            "commit_sha": commit_sha,
             "review_url": env.get("base_url"),
             "message": message,
         }
@@ -865,6 +866,9 @@ class LeaseManager:
             fields["deploying_at"] = now
         if to_status == "deployed_for_qa":
             fields["deployed_at"] = now
+            served_commit = payload.get("served_commit") if isinstance(payload, dict) else None
+            if served_commit and not lease.get("commit_sha"):
+                fields["commit_sha"] = str(served_commit)
         if to_status == "prod_deploying":
             fields["prod_deploying_at"] = now
         assignments = ", ".join(f"{key} = ?" for key in fields)

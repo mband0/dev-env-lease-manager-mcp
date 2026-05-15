@@ -544,6 +544,56 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertNotIn("callback_api_key", attempts[-1])
         self.assertNotIn("test-key", json.dumps(attempts))
 
+    def test_queue_callback_uses_served_commit_when_queued_commit_missing(self) -> None:
+        manager, tmp = self.make_manager(
+            deploy_command="true",
+            served_commit_command="printf resolved-commit",
+        )
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        active = manager.acquire("agent-hq-dev", "425", "anchor", commit="active")["lease"]
+        captured_events: list[dict[str, object]] = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok":true}'
+
+        def fake_urlopen(request, timeout=15):
+            captured_events.append(json.loads(request.data.decode("utf-8")))
+            return Response()
+
+        with patch("dev_env_lease_manager.manager.urllib.request.urlopen", side_effect=fake_urlopen):
+            queued = manager.lease_aware_deploy(
+                "agent-hq-dev",
+                "426",
+                "cinder",
+                str(source),
+                branch="task-426",
+                commit=None,
+                health_check=False,
+                queue_if_busy=True,
+                callback_url="http://agent-hq.local",
+                callback_api_key="test-key",
+            )["queue"]
+            manager.force_release("operator", "free queue", lease_id=active["id"], sweep_queue_after_release=False)
+            manager.sweep_deploy_queue("queue-worker", dry_run=False)
+
+        self.assertEqual(captured_events[-1]["event"], "deployed_for_qa")
+        self.assertEqual(captured_events[-1]["commit_sha"], "resolved-commit")
+        active_lease = manager.status(environment_id="agent-hq-dev")["environments"][0]["active_lease"]
+        self.assertEqual(active_lease["commit_sha"], "resolved-commit")
+        attempts = manager.callback_attempts(queue_id=queued["id"], limit=10)["callback_attempts"]
+        deployed_attempt = next(attempt for attempt in attempts if attempt["event"] == "deployed_for_qa")
+        self.assertEqual(deployed_attempt["payload"]["commit_sha"], "resolved-commit")
+
     def test_callback_attempt_logs_http_failure(self) -> None:
         manager, tmp = self.make_manager()
         source = Path(tmp.name) / "source"
