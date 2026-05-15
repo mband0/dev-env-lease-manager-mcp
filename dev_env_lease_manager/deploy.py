@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -157,9 +158,81 @@ class NativeDevDeployer:
         if errors:
             raise NativeDeployError("package_scripts_missing", {"errors": errors})
 
-    def _ensure_deps(self, package_dir: str) -> None:
-        if not (Path(package_dir) / "node_modules").is_dir():
-            self._run(["npm", "install", "--production=false"], cwd=package_dir)
+    def _dependency_fingerprint(self, package_dir: str) -> str:
+        digest = hashlib.sha256()
+        for filename in ("package.json", "package-lock.json"):
+            path = Path(package_dir) / filename
+            digest.update(filename.encode("utf-8"))
+            digest.update(b"\0")
+            if path.exists():
+                digest.update(path.read_bytes())
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _direct_dependencies(self, package_dir: str) -> list[str]:
+        package_path = Path(package_dir) / "package.json"
+        try:
+            package = json.loads(package_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise NativeDeployError("package_json_unreadable", {"package_dir": package_dir, "detail": str(exc)})
+
+        names: list[str] = []
+        for section in ("dependencies", "devDependencies"):
+            entries = package.get(section) or {}
+            if isinstance(entries, dict):
+                names.extend(str(name) for name in entries.keys())
+        return sorted(set(names))
+
+    def _missing_direct_dependencies(self, package_dir: str) -> list[str]:
+        node_modules = Path(package_dir) / "node_modules"
+        missing: list[str] = []
+        for name in self._direct_dependencies(package_dir):
+            dependency_path = node_modules.joinpath(*name.split("/"))
+            if not dependency_path.exists():
+                missing.append(name)
+        return missing
+
+    def _ensure_deps(self, package_dir: str, timeout_seconds: int) -> Dict[str, Any]:
+        node_modules = Path(package_dir) / "node_modules"
+        marker = node_modules / ".agent-hq-deploy-deps.sha256"
+        fingerprint = self._dependency_fingerprint(package_dir)
+        marker_value = marker.read_text(encoding="utf-8").strip() if marker.exists() else None
+        missing_before = self._missing_direct_dependencies(package_dir) if node_modules.is_dir() else []
+        install_reason: str | None = None
+
+        if not node_modules.is_dir():
+            install_reason = "node_modules_missing"
+        elif marker_value != fingerprint:
+            install_reason = "dependency_manifest_changed"
+        elif missing_before:
+            install_reason = "direct_dependencies_missing"
+
+        install_command: list[str] | None = None
+        if install_reason:
+            install_command = ["npm", "ci", "--include=dev"] if (Path(package_dir) / "package-lock.json").is_file() else ["npm", "install", "--include=dev"]
+            self._run(install_command, cwd=package_dir, timeout=timeout_seconds)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(f"{fingerprint}\n", encoding="utf-8")
+
+        missing_after = self._missing_direct_dependencies(package_dir)
+        if missing_after:
+            raise NativeDeployError(
+                "package_dependencies_incomplete",
+                {
+                    "package_dir": package_dir,
+                    "missing_dependencies": missing_after,
+                    "install_reason": install_reason,
+                    "install_command": install_command,
+                },
+            )
+
+        return {
+            "package_dir": package_dir,
+            "installed": bool(install_reason),
+            "install_reason": install_reason,
+            "install_command": install_command,
+            "missing_before": missing_before,
+        }
 
     def _prepare_dev_checkout(self, dev_repo_path: str, timeout_seconds: int) -> Dict[str, Any]:
         status = self._git(dev_repo_path, "status", "--porcelain=v1", "--untracked-files=all").stdout.strip()
@@ -296,9 +369,10 @@ class NativeDevDeployer:
             shutil.rmtree(Path(dev_repo_path) / "api/dist", ignore_errors=True)
             shutil.rmtree(Path(dev_repo_path) / "ui/.next", ignore_errors=True)
 
+            dependency_setup: Dict[str, Any] = {}
             if "api" in service_list:
                 api_dir = str(Path(dev_repo_path) / "api")
-                self._ensure_deps(api_dir)
+                dependency_setup["api"] = self._ensure_deps(api_dir, timeout_seconds)
                 self._run(["npm", "run", "build"], cwd=api_dir, timeout=timeout_seconds)
                 self._run(["pm2", "delete", api_name], timeout=60, check=False)
                 api_env = os.environ.copy()
@@ -316,7 +390,7 @@ class NativeDevDeployer:
 
             if "ui" in service_list:
                 ui_dir = str(Path(dev_repo_path) / "ui")
-                self._ensure_deps(ui_dir)
+                dependency_setup["ui"] = self._ensure_deps(ui_dir, timeout_seconds)
                 self._run(["npm", "run", "build"], cwd=ui_dir, timeout=timeout_seconds)
                 self._run(["pm2", "delete", ui_name], timeout=60, check=False)
                 ui_env = os.environ.copy()
@@ -343,6 +417,7 @@ class NativeDevDeployer:
                     "api": {"cwd": f"{dev_repo_path}/api", "name": api_name, "args": ["start"]},
                     "ui": {"cwd": f"{dev_repo_path}/ui", "name": ui_name, "args": ["run", "start-dev"]},
                     "dev_predeploy_cleanup": dev_predeploy_cleanup,
+                    "dependency_setup": dependency_setup,
                 },
             }
             Path(state_file).parent.mkdir(parents=True, exist_ok=True)
@@ -357,6 +432,7 @@ class NativeDevDeployer:
                 "state_file": state_file,
                 "services": service_list,
                 "dev_predeploy_cleanup": dev_predeploy_cleanup,
+                "dependency_setup": dependency_setup,
                 "health": health,
             }
         finally:

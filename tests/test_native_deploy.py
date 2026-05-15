@@ -215,6 +215,37 @@ class NativeDeployTests(unittest.TestCase):
         self.assertIn(["git", "-C", str(dev.resolve()), "reset", "--hard"], commands)
         self.assertIn(["git", "-C", str(dev.resolve()), "clean", "-ffd"], commands)
 
+    def test_ensure_deps_repairs_existing_node_modules_missing_dev_dependency(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        package_dir = Path(tmp.name) / "ui"
+        package_dir.mkdir()
+        (package_dir / "package.json").write_text(
+            json.dumps({
+                "scripts": {"lint": "eslint lib/*.ts"},
+                "devDependencies": {"eslint": "^9.27.0"},
+            }),
+            encoding="utf-8",
+        )
+        (package_dir / "package-lock.json").write_text("{}", encoding="utf-8")
+        (package_dir / "node_modules").mkdir()
+        commands: list[list[str]] = []
+
+        def runner(args, cwd=None, env=None, text=True, capture_output=True, timeout=None):
+            commands.append(list(args))
+            if args == ["npm", "ci", "--include=dev"]:
+                (Path(cwd) / "node_modules" / "eslint").mkdir()
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        result = NativeDevDeployer(runner)._ensure_deps(str(package_dir), timeout_seconds=60)
+
+        self.assertTrue(result["installed"])
+        self.assertEqual(result["install_reason"], "dependency_manifest_changed")
+        self.assertEqual(result["install_command"], ["npm", "ci", "--include=dev"])
+        self.assertEqual(result["missing_before"], ["eslint"])
+        self.assertIn(["npm", "ci", "--include=dev"], commands)
+        self.assertTrue((package_dir / "node_modules" / ".agent-hq-deploy-deps.sha256").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

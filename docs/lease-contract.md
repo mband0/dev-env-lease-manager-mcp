@@ -17,11 +17,12 @@ An environment is a shared deployment target that can be owned by at most one ac
   "base_url": "http://127.0.0.1:3510",
   "health_url": "http://127.0.0.1:3511/health",
   "repo_path": "~/agent-hq-dev",
-  "deploy_command": "~/agent-hq/scripts/capability-tools/deploy_dev_worktree.sh",
   "served_commit_command": "git -C ~/agent-hq-dev rev-parse HEAD",
   "stale_after_seconds": 7200,
   "tags": ["agent-hq", "dev"],
-  "metadata": {}
+  "metadata": {
+    "deploy_mode": "native"
+  }
 }
 ```
 
