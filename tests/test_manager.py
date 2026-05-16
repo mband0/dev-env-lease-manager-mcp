@@ -12,6 +12,46 @@ from dev_env_lease_manager.config import load_config
 from dev_env_lease_manager.manager import LeaseManager
 
 
+class MockHttpResponse:
+    def __init__(self, body: dict[str, object] | bytes | str | None = None, status: int = 200):
+        self.status = status
+        if body is None:
+            self._body = b'{"ok":true}'
+        elif isinstance(body, bytes):
+            self._body = body
+        elif isinstance(body, str):
+            self._body = body.encode("utf-8")
+        else:
+            self._body = json.dumps(body).encode("utf-8")
+
+    def __enter__(self) -> "MockHttpResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def is_active_owner_request(request: object) -> bool:
+    return getattr(request, "full_url", "").endswith("/active-owner")
+
+
+def active_owner_response(task_id: str = "426", agent_id: int = 94) -> MockHttpResponse:
+    return MockHttpResponse({
+        "ok": True,
+        "task_id": int(task_id),
+        "authenticated_agent_id": agent_id,
+        "authenticated_agent_slug": "cinder-backend",
+        "active_instance_id": 7001,
+        "active_instance_agent_id": agent_id,
+        "active_instance_status": "running",
+        "is_active_owner": True,
+        "reason": "active_instance_owned_by_authenticated_agent",
+    })
+
+
 class ManagerTestCase(unittest.TestCase):
     def make_manager(self, stale_after_seconds: int = 3600, deploy_command: str | None = None,
                      served_commit_command: str | None = None,
@@ -498,6 +538,8 @@ class LeaseManagerTests(ManagerTestCase):
                 return b'{"ok":true}'
 
         def fake_urlopen(request, timeout=15):
+            if is_active_owner_request(request):
+                return active_owner_response()
             captured_events.append(json.loads(request.data.decode("utf-8")))
             captured_headers.append({key.lower(): value for key, value in request.header_items()})
             return Response()
@@ -567,6 +609,8 @@ class LeaseManagerTests(ManagerTestCase):
                 return b'{"ok":true}'
 
         def fake_urlopen(request, timeout=15):
+            if is_active_owner_request(request):
+                return active_owner_response()
             captured_events.append(json.loads(request.data.decode("utf-8")))
             return Response()
 
@@ -612,7 +656,12 @@ class LeaseManagerTests(ManagerTestCase):
             def read(self) -> bytes:
                 return b'{"ok":false,"error":"down"}'
 
-        with patch("dev_env_lease_manager.manager.urllib.request.urlopen", return_value=Response()):
+        def fake_urlopen(request, timeout=15):
+            if is_active_owner_request(request):
+                return active_owner_response()
+            return Response()
+
+        with patch("dev_env_lease_manager.manager.urllib.request.urlopen", side_effect=fake_urlopen):
             result = manager.lease_aware_deploy(
                 "agent-hq-dev",
                 "426",
@@ -657,6 +706,8 @@ class LeaseManagerTests(ManagerTestCase):
                 return b'{"ok":true}'
 
         def fake_urlopen(request, timeout=15):
+            if is_active_owner_request(request):
+                return active_owner_response()
             captured_events.append(json.loads(request.data.decode("utf-8")))
             captured_urls.append(request.full_url)
             captured_headers.append({key.lower(): value for key, value in request.header_items()})
@@ -699,6 +750,8 @@ class LeaseManagerTests(ManagerTestCase):
                 return b'{"ok":true}'
 
         def fake_urlopen(request, timeout=15):
+            if is_active_owner_request(request):
+                return active_owner_response()
             captured_events.append(json.loads(request.data.decode("utf-8")))
             return Response()
 
@@ -746,6 +799,8 @@ class LeaseManagerTests(ManagerTestCase):
                 return b'{"ok":true}'
 
         def fake_urlopen(request, timeout=15):
+            if is_active_owner_request(request):
+                return active_owner_response()
             captured_events.append(json.loads(request.data.decode("utf-8")))
             return Response()
 
@@ -790,6 +845,114 @@ class LeaseManagerTests(ManagerTestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "callback_api_key_required")
+
+    def test_deploy_rejects_when_active_owner_authorization_fails(self) -> None:
+        manager, tmp = self.make_manager(agent_hq={
+            "base_url": "http://agent-hq.local",
+        })
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+
+        def fake_urlopen(request, timeout=15):
+            self.assertTrue(is_active_owner_request(request))
+            return MockHttpResponse({
+                "ok": True,
+                "task_id": 398,
+                "authenticated_agent_id": 94,
+                "authenticated_agent_slug": "cinder-backend",
+                "active_instance_id": None,
+                "is_active_owner": False,
+                "reason": "task_has_no_active_instance",
+            })
+
+        with patch.dict("os.environ", {"AGENT_HQ_MCP_API_KEY": "agent-key"}), \
+             patch("dev_env_lease_manager.manager.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = manager.lease_aware_deploy(
+                "agent-hq-dev",
+                "398",
+                "cinder",
+                str(source),
+                branch="task-398",
+                commit="wrong-commit",
+                dry_run=True,
+                queue_if_busy=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "deploy_authorization_failed")
+        self.assertEqual(result["reason"], "task_has_no_active_instance")
+        self.assertTrue(manager.status()["environments"][0]["available"])
+        self.assertEqual(manager.queue_status("agent-hq-dev")["queue"], [])
+
+    def test_deploy_records_active_owner_authorization_metadata(self) -> None:
+        manager, tmp = self.make_manager(agent_hq={
+            "base_url": "http://agent-hq.local",
+        })
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+
+        def fake_urlopen(request, timeout=15):
+            if is_active_owner_request(request):
+                self.assertEqual(request.full_url, "http://agent-hq.local/api/v1/tasks/426/active-owner")
+                return active_owner_response()
+            return MockHttpResponse()
+
+        with patch.dict("os.environ", {"AGENT_HQ_MCP_API_KEY": "agent-key"}), \
+             patch("dev_env_lease_manager.manager.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = manager.lease_aware_deploy(
+                "agent-hq-dev",
+                "426",
+                "cinder",
+                str(source),
+                branch="task-426",
+                commit="direct-commit",
+                dry_run=True,
+            )
+
+        self.assertTrue(result["ok"])
+        metadata = result["lease"]["metadata"]
+        authorization = metadata["active_owner_authorization"]
+        self.assertEqual(authorization["task_id"], 426)
+        self.assertEqual(authorization["authenticated_agent_id"], 94)
+        self.assertEqual(authorization["active_instance_id"], 7001)
+        self.assertEqual(authorization["active_instance_status"], "running")
+        self.assertNotIn("agent-key", json.dumps(metadata))
+
+    def test_queued_deploy_stores_authorization_and_sweep_does_not_revalidate(self) -> None:
+        manager, tmp = self.make_manager(agent_hq={
+            "base_url": "http://agent-hq.local",
+        })
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        active = manager.acquire("agent-hq-dev", "425", "anchor", commit="active")["lease"]
+        active_owner_checks = 0
+
+        def fake_urlopen(request, timeout=15):
+            nonlocal active_owner_checks
+            if is_active_owner_request(request):
+                active_owner_checks += 1
+                return active_owner_response()
+            return MockHttpResponse()
+
+        with patch.dict("os.environ", {"AGENT_HQ_MCP_API_KEY": "agent-key"}), \
+             patch("dev_env_lease_manager.manager.urllib.request.urlopen", side_effect=fake_urlopen):
+            queued = manager.lease_aware_deploy(
+                "agent-hq-dev",
+                "426",
+                "cinder",
+                str(source),
+                branch="task-426",
+                commit="queued-commit",
+                dry_run=True,
+                queue_if_busy=True,
+            )["queue"]
+            manager.force_release("operator", "free queue", lease_id=active["id"], sweep_queue_after_release=False)
+            result = manager.sweep_deploy_queue("queue-worker", dry_run=True)
+
+        self.assertEqual(active_owner_checks, 1)
+        self.assertEqual(queued["metadata"]["active_owner_authorization"]["task_id"], 426)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["processed"][0]["queue"]["id"], queued["id"])
 
     def test_newer_same_task_queue_request_supersedes_existing_queued_request(self) -> None:
         manager, tmp = self.make_manager()

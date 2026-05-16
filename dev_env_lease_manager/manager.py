@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 from typing import Any, Dict, Iterable, Optional
 import urllib.error
+import urllib.parse
 import urllib.request
 from uuid import uuid4
 
@@ -394,6 +395,127 @@ class LeaseManager:
         if normalized.endswith("/api/v1/external/task-events"):
             return normalized
         return f"{normalized}/api/v1/external/task-events"
+
+    def _agent_hq_base_url(self, callback_url: Optional[str]) -> Optional[str]:
+        raw_url = self._callback_url(callback_url)
+        if not raw_url:
+            return None
+        normalized = str(raw_url).rstrip("/")
+        task_events_suffix = "/api/v1/external/task-events"
+        api_suffix = "/api/v1"
+        if normalized.endswith(task_events_suffix):
+            normalized = normalized[:-len(task_events_suffix)]
+        elif normalized.endswith(api_suffix):
+            normalized = normalized[:-len(api_suffix)]
+        return normalized.rstrip("/") or None
+
+    def _task_active_owner_endpoint(self, base_url: str, task_id: str) -> str:
+        encoded_task_id = urllib.parse.quote(str(task_id), safe="")
+        return f"{base_url.rstrip('/')}/api/v1/tasks/{encoded_task_id}/active-owner"
+
+    def _parse_json_body(self, body: str) -> Dict[str, Any]:
+        try:
+            parsed = json.loads(body or "{}")
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _validate_task_active_owner(self, task_id: str, callback_url: Optional[str],
+                                    callback_api_key: Optional[str]) -> Dict[str, Any]:
+        base_url = self._agent_hq_base_url(callback_url)
+        if not base_url:
+            return {"ok": True, "skipped": True, "reason": "agent_hq_not_configured"}
+
+        api_key = self._callback_api_key(callback_api_key)
+        if not api_key:
+            return {
+                "ok": False,
+                "error": "callback_api_key_required",
+                "message": "AGENT_HQ_MCP_API_KEY is required in the lease manager MCP server env when Agent HQ callbacks are configured.",
+            }
+
+        endpoint = self._task_active_owner_endpoint(base_url, task_id)
+        request = urllib.request.Request(
+            endpoint,
+            headers={"Accept": "application/json", "x-api-key": str(api_key)},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                response_body = response.read().decode("utf-8", errors="replace")
+                status = int(response.status)
+        except urllib.error.HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace")
+            authorization = self._parse_json_body(response_body)
+            return {
+                "ok": False,
+                "error": "deploy_authorization_failed",
+                "reason": authorization.get("reason") or authorization.get("code") or "active_owner_check_http_failure",
+                "message": authorization.get("error") or f"Agent HQ active owner check failed with HTTP {exc.code}.",
+                "http_status": exc.code,
+                "endpoint": endpoint,
+                "authorization": authorization,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": "deploy_authorization_check_failed",
+                "reason": "active_owner_check_transport_error",
+                "message": str(exc),
+                "endpoint": endpoint,
+            }
+
+        authorization = self._parse_json_body(response_body)
+        if not 200 <= status < 300:
+            return {
+                "ok": False,
+                "error": "deploy_authorization_failed",
+                "reason": authorization.get("reason") or authorization.get("code") or "active_owner_check_http_failure",
+                "message": authorization.get("error") or f"Agent HQ active owner check failed with HTTP {status}.",
+                "http_status": status,
+                "endpoint": endpoint,
+                "authorization": authorization,
+            }
+        if not authorization:
+            return {
+                "ok": False,
+                "error": "deploy_authorization_check_failed",
+                "reason": "active_owner_check_invalid_response",
+                "message": "Agent HQ active owner endpoint returned an invalid JSON object.",
+                "http_status": status,
+                "endpoint": endpoint,
+            }
+        if authorization.get("is_active_owner") is True:
+            return {
+                "ok": True,
+                "endpoint": endpoint,
+                "http_status": status,
+                "authorization": authorization,
+            }
+        return {
+            "ok": False,
+            "error": "deploy_authorization_failed",
+            "reason": authorization.get("reason") or authorization.get("code") or "not_active_task_owner",
+            "message": authorization.get("error") or "Authenticated agent is not the active owner for the requested task.",
+            "http_status": status,
+            "endpoint": endpoint,
+            "authorization": authorization,
+        }
+
+    def _active_owner_authorization_metadata(self, authorization_result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        authorization = authorization_result.get("authorization")
+        if not isinstance(authorization, dict) or authorization.get("is_active_owner") is not True:
+            return None
+        return {
+            "validated_at": utc_now(),
+            "task_id": authorization.get("task_id"),
+            "authenticated_agent_id": authorization.get("authenticated_agent_id"),
+            "authenticated_agent_slug": authorization.get("authenticated_agent_slug"),
+            "active_instance_id": authorization.get("active_instance_id"),
+            "active_instance_agent_id": authorization.get("active_instance_agent_id"),
+            "active_instance_status": authorization.get("active_instance_status"),
+            "reason": authorization.get("reason"),
+        }
 
     def _failure_class_from_error(self, error: Optional[Dict[str, Any]]) -> Optional[str]:
         if not isinstance(error, dict):
@@ -1222,6 +1344,13 @@ class LeaseManager:
         if not os.path.isdir(source_repo_path):
             return {"ok": False, "error": "source_repo_path_not_found", "source_repo_path": source_repo_path}
         database_policy = normalize_database_policy(database_policy)
+        active_owner_check = self._validate_task_active_owner(str(task_id), callback_url, callback_api_key)
+        if not active_owner_check.get("ok"):
+            return active_owner_check
+        deploy_metadata: Dict[str, Any] = {"database_policy": database_policy}
+        authorization_metadata = self._active_owner_authorization_metadata(active_owner_check)
+        if authorization_metadata:
+            deploy_metadata["active_owner_authorization"] = authorization_metadata
         target_env = env
         target_environment_id = environment_id
         acquire = self.acquire(
@@ -1237,7 +1366,7 @@ class LeaseManager:
                 environment_id,
                 source_repo_path,
                 assigned_environment_id=target_environment_id,
-                extra={"database_policy": database_policy},
+                extra=deploy_metadata,
             ),
             supersede_same_task_review=True,
         )
@@ -1261,7 +1390,7 @@ class LeaseManager:
                         environment_id,
                         source_repo_path,
                         assigned_environment_id=target_environment_id,
-                        extra={"selected_after_busy_owner": queued_because_owner, "database_policy": database_policy},
+                        extra={**deploy_metadata, "selected_after_busy_owner": queued_because_owner},
                     ),
                     supersede_same_task_review=True,
                 )
@@ -1276,7 +1405,7 @@ class LeaseManager:
             if not acquire.get("ok"):
                 if acquire.get("error") == "environment_busy" and not queued_because_owner:
                     queued_because_owner = acquire.get("owner")
-                metadata = {"queued_because_owner": queued_because_owner}
+                metadata = {**deploy_metadata, "queued_because_owner": queued_because_owner}
                 if target_environment_id != environment_id:
                     metadata["alternate_busy_owner"] = acquire.get("owner")
                     metadata["attempted_assignment_environment_id"] = target_environment_id
