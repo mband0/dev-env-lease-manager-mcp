@@ -246,6 +246,108 @@ class NativeDeployTests(unittest.TestCase):
         self.assertIn(["npm", "ci", "--include=dev"], commands)
         self.assertTrue((package_dir / "node_modules" / ".agent-hq-deploy-deps.sha256").is_file())
 
+    def test_database_migration_preflight_runs_before_api_restart(self) -> None:
+        _, source, dev, canonical = self.make_layout()
+        write_package(dev / "api/package.json", {
+            "build": "tsc",
+            "start": "node dist/index.js",
+            "db:migrate": "node dist/db/migrate.js",
+            "db:migrate:preflight": "node dist/db/migrate.js",
+            "db:migrate:status": "node dist/db/migrateStatus.js",
+        })
+        commands: list[list[str]] = []
+        deployer = NativeDevDeployer(self.fake_runner(source, dev, commands))
+        state_dir = Path(source.parent) / "state"
+
+        result = deployer.deploy(
+            {
+                "id": "agent-hq-dev",
+                "repo_path": str(dev),
+                "metadata": {
+                    "canonical_root": str(canonical),
+                    "state_dir": str(state_dir),
+                    "dev_db_path": str(dev / "agent-hq-dev.db"),
+                },
+            },
+            str(source),
+            services="api",
+            health_check=False,
+            expected_commit="abc123",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["database_migration"]["applied"])
+        migrate_preflight = commands.index(["npm", "run", "db:migrate:preflight"])
+        migrate_apply = commands.index(["npm", "run", "db:migrate"])
+        pm2_delete = commands.index(["pm2", "delete", "agent-hq-dev-api"])
+        self.assertLess(migrate_preflight, pm2_delete)
+        self.assertLess(migrate_apply, pm2_delete)
+
+    def test_database_migration_preflight_failure_does_not_restart_api(self) -> None:
+        _, source, dev, canonical = self.make_layout()
+        write_package(dev / "api/package.json", {
+            "build": "tsc",
+            "start": "node dist/index.js",
+            "db:migrate": "node dist/db/migrate.js",
+            "db:migrate:preflight": "node dist/db/migrate.js",
+        })
+        source_path = str(source.resolve())
+        dev_path = str(dev.resolve())
+        commands: list[list[str]] = []
+
+        def runner(args, cwd=None, env=None, text=True, capture_output=True, timeout=None):
+            commands.append(list(args))
+            stdout = ""
+            returncode = 0
+            if args[:4] == ["git", "-C", source_path, "rev-parse"] and args[4:] == ["--show-toplevel"]:
+                stdout = f"{source_path}\n"
+            elif args[:4] == ["git", "-C", source_path, "status"]:
+                stdout = ""
+            elif args[:4] == ["git", "-C", source_path, "rev-parse"] and args[4:] == ["HEAD"]:
+                stdout = "abc123\n"
+            elif args[:4] == ["git", "-C", source_path, "branch"]:
+                stdout = "feature/native-deploy\n"
+            elif args[:4] == ["git", "-C", dev_path, "rev-parse"] and args[4:] == ["--show-toplevel"]:
+                stdout = f"{dev_path}\n"
+            elif args[:4] == ["git", "-C", dev_path, "diff"]:
+                returncode = 0
+            elif args[:4] == ["git", "-C", dev_path, "ls-files"]:
+                stdout = ""
+            elif args[:4] == ["git", "-C", dev_path, "rev-parse"] and args[4:] == ["HEAD"]:
+                stdout = "previous\n"
+            elif args[:4] == ["git", "-C", dev_path, "fetch"]:
+                stdout = ""
+            elif args[:4] == ["git", "-C", dev_path, "rev-parse"] and args[4:] == ["FETCH_HEAD"]:
+                stdout = "abc123\n"
+            elif args[:4] == ["git", "-C", dev_path, "reset"]:
+                stdout = "HEAD is now at abc123\n"
+            elif args == ["pm2", "jlist"]:
+                stdout = "[]"
+            elif args == ["npm", "run", "db:migrate:preflight"]:
+                returncode = 1
+                stdout = ""
+                return subprocess.CompletedProcess(args, returncode, stdout, "no such column: project_id")
+            return subprocess.CompletedProcess(args, returncode, stdout, "")
+
+        deployer = NativeDevDeployer(runner)
+        state_dir = source.parent / "state"
+
+        with self.assertRaises(NativeDeployError) as caught:
+            deployer.deploy(
+                {
+                    "id": "agent-hq-dev",
+                    "repo_path": str(dev),
+                    "metadata": {"canonical_root": str(canonical), "state_dir": str(state_dir)},
+                },
+                str(source),
+                services="api",
+                health_check=False,
+                expected_commit="abc123",
+            )
+
+        self.assertEqual(caught.exception.error, "database_migration_failed")
+        self.assertNotIn(["pm2", "delete", "agent-hq-dev-api"], commands)
+
 
 if __name__ == "__main__":
     unittest.main()

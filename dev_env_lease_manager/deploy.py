@@ -6,13 +6,48 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
+import tempfile
 import time
 from typing import Any, Callable, Dict, Iterable, Optional
 import urllib.request
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+DEPLOY_FAILURE_EVENTS = {
+    "database_backup_failed",
+    "database_migration_failed",
+    "database_integrity_failed",
+    "api_boot_failed",
+    "api_health_failed",
+    "ui_health_failed",
+    "process_restart_failed",
+    "checkout_failed",
+    "build_failed",
+}
+
+
+def normalize_database_policy(value: str | None) -> str:
+    policy = (value or "preflight_and_apply").strip()
+    allowed = {"none", "status_only", "preflight_only", "preflight_and_apply"}
+    if policy not in allowed:
+        raise NativeDeployError("invalid_database_policy", {"database_policy": policy, "allowed": sorted(allowed)})
+    return policy
+
+
+def command_failure_class(args: list[str]) -> str:
+    if args and args[0] == "git":
+        return "checkout_failed"
+    if args[:2] == ["npm", "run"] or args[:1] == ["npm"]:
+        return "build_failed"
+    if args and args[0] == "pm2":
+        if len(args) > 1 and args[1] == "start" and any(part.endswith("-api") for part in args):
+            return "api_boot_failed"
+        return "process_restart_failed"
+    return "process_restart_failed"
 
 
 def commit_matches_expected(actual: str, expected: Optional[str]) -> bool:
@@ -34,8 +69,12 @@ class NativeDeployError(Exception):
 
     def payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"ok": False, "error": self.error}
+        if self.error in DEPLOY_FAILURE_EVENTS:
+            payload["failure_class"] = self.error
         if self.detail:
             payload.update(self.detail)
+            if "failure_class" not in payload and self.detail.get("failure_class"):
+                payload["failure_class"] = self.detail["failure_class"]
         return payload
 
 
@@ -81,9 +120,11 @@ class NativeDevDeployer:
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            failure_class = command_failure_class(args)
             raise NativeDeployError(
-                "command_timed_out",
+                failure_class,
                 {
+                    "failure_class": failure_class,
                     "command": args,
                     "cwd": cwd,
                     "timeout_seconds": timeout,
@@ -92,9 +133,11 @@ class NativeDevDeployer:
                 },
             )
         if check and completed.returncode != 0:
+            failure_class = command_failure_class(args)
             raise NativeDeployError(
-                "command_failed",
+                failure_class,
                 {
+                    "failure_class": failure_class,
                     "command": args,
                     "cwd": cwd,
                     "returncode": completed.returncode,
@@ -278,8 +321,149 @@ class NativeDevDeployer:
                     time.sleep(1)
             results[name] = {"ok": ok, "detail": detail, "url": url}
         if not all(result["ok"] for result in results.values()):
-            raise NativeDeployError("health_check_failed", {"health": results})
+            failure_class = "api_health_failed" if not results.get("api", {}).get("ok", True) else "ui_health_failed"
+            raise NativeDeployError(failure_class, {"failure_class": failure_class, "health": results})
         return results
+
+    def _package_script(self, package_dir: str, script: str) -> bool:
+        package_path = Path(package_dir) / "package.json"
+        try:
+            package = json.loads(package_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        scripts = package.get("scripts") or {}
+        return isinstance(scripts, dict) and script in scripts
+
+    def _run_migration_script(
+        self,
+        api_dir: str,
+        script: str,
+        db_path: str,
+        api_port: str,
+        timeout_seconds: int,
+    ) -> Dict[str, Any]:
+        env = os.environ.copy()
+        env.update({
+            "AGENT_HQ_DB_PATH": db_path,
+            "PORT": api_port,
+            "AGENT_HQ_APP_COMMIT": env.get("AGENT_HQ_APP_COMMIT", ""),
+        })
+        try:
+            completed = self._run(["npm", "run", script], cwd=api_dir, env=env, timeout=timeout_seconds)
+        except NativeDeployError as exc:
+            payload = exc.payload()
+            raise NativeDeployError(
+                "database_migration_failed",
+                {
+                    "failure_class": "database_migration_failed",
+                    "phase": script,
+                    "db_path": db_path,
+                    "script": script,
+                    "command_error": payload,
+                },
+            )
+        return {
+            "script": script,
+            "db_path": db_path,
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+        }
+
+    def _sqlite_integrity_check(self, db_path: str, phase: str) -> Dict[str, Any]:
+        try:
+            with sqlite3.connect(db_path) as conn:
+                rows = [row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()]
+        except Exception as exc:
+            raise NativeDeployError(
+                "database_integrity_failed",
+                {"failure_class": "database_integrity_failed", "phase": phase, "db_path": db_path, "detail": str(exc)},
+            )
+        ok = rows == ["ok"]
+        if not ok:
+            raise NativeDeployError(
+                "database_integrity_failed",
+                {"failure_class": "database_integrity_failed", "phase": phase, "db_path": db_path, "integrity": rows},
+            )
+        return {"ok": True, "db_path": db_path, "integrity": rows}
+
+    def _copy_sqlite_snapshot(self, source_path: str, target_path: str, phase: str) -> None:
+        try:
+            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(f"file:{source_path}?mode=ro", uri=True) as source_conn:
+                with sqlite3.connect(target_path) as target_conn:
+                    source_conn.backup(target_conn)
+        except Exception as exc:
+            raise NativeDeployError(
+                "database_backup_failed",
+                {
+                    "failure_class": "database_backup_failed",
+                    "phase": phase,
+                    "db_path": source_path,
+                    "target_path": target_path,
+                    "detail": str(exc),
+                },
+            )
+
+    def _backup_database(self, db_path: str, backup_dir: str, source_sha: str) -> str | None:
+        source = Path(db_path)
+        if not source.exists():
+            return None
+        backup_path = Path(backup_dir) / f"{source.name}.{int(time.time())}.{source_sha[:12]}.bak"
+        self._copy_sqlite_snapshot(db_path, str(backup_path), "backup")
+        return str(backup_path)
+
+    def _run_database_migrations(
+        self,
+        api_dir: str,
+        db_path: str,
+        backup_dir: str,
+        api_port: str,
+        source_sha: str,
+        database_policy: str,
+        timeout_seconds: int,
+    ) -> Dict[str, Any]:
+        policy = normalize_database_policy(database_policy)
+        result: Dict[str, Any] = {"policy": policy, "db_path": db_path, "applied": False, "preflight": None}
+        if policy == "none":
+            return result
+
+        has_status = self._package_script(api_dir, "db:migrate:status")
+        has_preflight = self._package_script(api_dir, "db:migrate:preflight")
+        has_migrate = self._package_script(api_dir, "db:migrate")
+        if not any((has_status, has_preflight, has_migrate)):
+            result["skipped"] = "migration_scripts_missing"
+            return result
+
+        if has_status:
+            result["status_before"] = self._run_migration_script(api_dir, "db:migrate:status", db_path, api_port, timeout_seconds)
+        if policy == "status_only":
+            return result
+
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        preflight_script = "db:migrate:preflight" if has_preflight else "db:migrate"
+        with tempfile.TemporaryDirectory(prefix="dev-env-db-preflight-") as tmp_dir:
+            preflight_db = str(Path(tmp_dir) / Path(db_path).name)
+            if Path(db_path).exists():
+                self._copy_sqlite_snapshot(db_path, preflight_db, "preflight")
+            result["preflight"] = self._run_migration_script(api_dir, preflight_script, preflight_db, api_port, timeout_seconds)
+            result["preflight_integrity"] = self._sqlite_integrity_check(preflight_db, "preflight")
+
+        if policy == "preflight_only":
+            return result
+        if not has_migrate:
+            raise NativeDeployError(
+                "database_migration_failed",
+                {"failure_class": "database_migration_failed", "phase": "apply", "detail": "api/package.json missing db:migrate script"},
+            )
+
+        backup_path = self._backup_database(db_path, backup_dir, source_sha)
+        result["backup_path"] = backup_path
+        result["apply"] = self._run_migration_script(api_dir, "db:migrate", db_path, api_port, timeout_seconds)
+        result["apply_integrity"] = self._sqlite_integrity_check(db_path, "apply")
+        result["applied"] = True
+        if has_status:
+            result["status_after"] = self._run_migration_script(api_dir, "db:migrate:status", db_path, api_port, timeout_seconds)
+        return result
 
     def deploy(
         self,
@@ -289,6 +473,7 @@ class NativeDevDeployer:
         health_check: bool = True,
         expected_commit: Optional[str] = None,
         timeout_seconds: int = 1800,
+        database_policy: str = "preflight_and_apply",
     ) -> Dict[str, Any]:
         metadata = env.get("metadata") or {}
         dev_repo_path = env.get("repo_path")
@@ -304,6 +489,8 @@ class NativeDevDeployer:
         api_port = str(metadata.get("api_port") or 3511)
         ui_port = str(metadata.get("ui_port") or 3510)
         dev_db_path = expand_path(str(metadata.get("dev_db_path") or str(Path(dev_repo_path) / "agent-hq-dev.db")))
+        backup_dir = expand_path(str(metadata.get("backup_dir") or str(Path(state_dir) / "db-backups")))
+        database_policy = normalize_database_policy(str(metadata.get("database_policy") or database_policy))
         service_list = normalize_services(services)
 
         source_repo_path = expand_path(source_repo_path)
@@ -374,6 +561,15 @@ class NativeDevDeployer:
                 api_dir = str(Path(dev_repo_path) / "api")
                 dependency_setup["api"] = self._ensure_deps(api_dir, timeout_seconds)
                 self._run(["npm", "run", "build"], cwd=api_dir, timeout=timeout_seconds)
+                migration_setup = self._run_database_migrations(
+                    api_dir,
+                    dev_db_path,
+                    backup_dir,
+                    api_port,
+                    source_sha,
+                    database_policy,
+                    timeout_seconds,
+                )
                 self._run(["pm2", "delete", api_name], timeout=60, check=False)
                 api_env = os.environ.copy()
                 api_env.update({
@@ -418,6 +614,8 @@ class NativeDevDeployer:
                     "ui": {"cwd": f"{dev_repo_path}/ui", "name": ui_name, "args": ["run", "start-dev"]},
                     "dev_predeploy_cleanup": dev_predeploy_cleanup,
                     "dependency_setup": dependency_setup,
+                    "database_policy": database_policy,
+                    "database_migration": migration_setup if "api" in service_list else None,
                 },
             }
             Path(state_file).parent.mkdir(parents=True, exist_ok=True)
@@ -433,6 +631,8 @@ class NativeDevDeployer:
                 "services": service_list,
                 "dev_predeploy_cleanup": dev_predeploy_cleanup,
                 "dependency_setup": dependency_setup,
+                "database_policy": database_policy,
+                "database_migration": migration_setup if "api" in service_list else None,
                 "health": health,
             }
         finally:

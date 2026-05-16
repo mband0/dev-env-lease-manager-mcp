@@ -21,6 +21,7 @@ Use the MCP tool:
   "services": "both",
   "health_check": true,
   "queue_if_busy": true,
+  "database_policy": "preflight_and_apply",
   "callback_url": "http://localhost:3501",
   "callback_api_key": "ahq_mcp_..."
 }
@@ -29,17 +30,25 @@ Use the MCP tool:
 Equivalent CLI:
 
 ```sh
-.venv/bin/dev-env-lease --config config/environments.json deploy agent-hq-dev --task-id 426 --actor cinder-backend --source-repo-path /path/to/agent/worktree --branch cinder/task-426 --commit abc123 --queue-if-busy --callback-url http://localhost:3501 --callback-api-key "$AGENT_HQ_MCP_API_KEY"
+.venv/bin/dev-env-lease --config config/environments.json deploy agent-hq-dev --task-id 426 --actor cinder-backend --source-repo-path /path/to/agent/worktree --branch cinder/task-426 --commit abc123 --queue-if-busy --database-policy preflight_and_apply --callback-url http://localhost:3501 --callback-api-key "$AGENT_HQ_MCP_API_KEY"
 ```
 
 The deploy path acquires a lease, marks it `deploying`, promotes the exact clean
-source `HEAD` into the configured persistent dev checkout, builds and restarts
-the configured services, verifies the served commit, and marks
-`deployed_for_qa` only after verification succeeds.
+source `HEAD` into the configured persistent dev checkout, builds the configured
+services, runs database migration checks according to `database_policy`, restarts
+PM2 services, verifies the served commit, and marks `deployed_for_qa` only after
+verification succeeds.
 
 For Agent HQ dev, this deploy behavior is native to the MCP server through
 `metadata.deploy_mode = "native"`. The older shell-command path remains
 available only when an environment explicitly sets deploy mode to `command`.
+
+`database_policy` controls migration behavior for native API deploys:
+
+- `preflight_and_apply` runs migration status, preflights on a copied database, backs up the live database, applies migrations, and runs integrity checks.
+- `preflight_only` runs the copied-database preflight and integrity check without mutating the live database.
+- `status_only` reports migration status and database integrity only.
+- `none` skips migration handling.
 
 ## Busy Or Missing Environment
 
@@ -73,7 +82,11 @@ materialized MCP environment as `AGENT_HQ_MCP_API_KEY`, or from an explicit
 
 When callback settings are supplied, the lease manager posts Agent HQ external
 task events for `dev_deploy_queued`, `dev_deploying`, `deployed_for_qa`,
-`deploy_failed`, `cancelled`, and `superseded`.
+`deploy_failed`, `cancelled`, and `superseded`. Known deploy failure classes are
+posted as specific events instead of generic `deploy_failed`: `database_backup_failed`,
+`database_migration_failed`, `database_integrity_failed`, `api_boot_failed`,
+`api_health_failed`, `ui_health_failed`, `process_restart_failed`, `checkout_failed`,
+and `build_failed`.
 
 Every callback attempt is recorded in the lease manager state database without
 storing the API key. Operators can inspect delivery with `callback-attempts` or

@@ -101,6 +101,16 @@ class McpServerTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertEqual(deploy.call_args.kwargs["timeout_seconds"], DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS)
+        self.assertEqual(deploy.call_args.kwargs["database_policy"], "preflight_and_apply")
+
+    def test_failure_class_errors_become_specific_callback_events(self) -> None:
+        service, manager, _ = self.make_service()
+        migration_error = {"stage": "deploy", "result": {"deploy": {"failure_class": "database_migration_failed", "phase": "db:migrate:preflight"}}}
+
+        self.assertEqual(manager._failure_event_name(migration_error), "database_migration_failed")
+        self.assertEqual(manager._failure_phase_from_error(migration_error), "db:migrate:preflight")
+        self.assertEqual(manager._failure_event_name({"stage": "deploy", "result": {"deploy": {"error": "api_health_failed"}}}), "api_health_failed")
+        self.assertEqual(manager._failure_event_name({"stage": "deploy", "result": {"deploy": {"error": "unknown"}}}), "deploy_failed")
 
     def test_tool_exception_returns_detailed_payload(self) -> None:
         service, manager, _ = self.make_service()

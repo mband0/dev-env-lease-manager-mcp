@@ -32,9 +32,16 @@ The server runs over MCP stdio:
 
 `dev_env_deploy_worktree` is the normal dev promotion tool. For environments
 with `metadata.deploy_mode = "native"`, the MCP server itself performs the
-persistent dev checkout promotion, build, PM2 restart, health check, served
-commit verification, and lease transition. Environments can still opt into the
-legacy external command path with `metadata.deploy_mode = "command"`.
+persistent dev checkout promotion, build, database migration preflight/apply,
+PM2 restart, health check, served commit verification, and lease transition.
+Environments can still opt into the legacy external command path with
+`metadata.deploy_mode = "command"`.
+
+`dev_env_deploy_worktree` accepts `database_policy`, defaulting to
+`preflight_and_apply`. Native API deploys use it to run migration status checks,
+a copied-database preflight, live-database backup, migration apply, and SQLite
+integrity checks before restarting the API. Use `preflight_only`, `status_only`,
+or `none` for narrower maintenance flows.
 
 Busy environment responses include owner task, agent, branch, commit, lease id,
 environment, and next action guidance. Agents must treat `environment_busy` as a
@@ -59,7 +66,11 @@ Queued deploys can call Agent HQ's external task event endpoint. Provide
 `/api/v1/external/task-events`, and `callback_api_key` as an Agent HQ MCP API
 key from the calling agent's materialized MCP environment. Callback events are
 `dev_deploy_queued`, `dev_deploying`, `deployed_for_qa`, `deploy_failed`,
-`cancelled`, and `superseded`.
+`cancelled`, and `superseded`. Known deploy failure classes are emitted as
+specific callback events when possible: `database_backup_failed`,
+`database_migration_failed`, `database_integrity_failed`, `api_boot_failed`,
+`api_health_failed`, `ui_health_failed`, `process_restart_failed`,
+`checkout_failed`, and `build_failed`.
 
 Each callback attempt is stored durably without the API key. Use
 `dev_env_callback_attempts` with `queue_id`, `lease_id`, `task_id`, or

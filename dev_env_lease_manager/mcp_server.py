@@ -106,6 +106,7 @@ class LeaseManagerMcpTools:
                 callback_url=a.get("callback_url"),
                 callback_api_key=a.get("callback_api_key"),
                 timeout_seconds=int(a.get("timeout_seconds") or DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS),
+                database_policy=a.get("database_policy", "preflight_and_apply"),
             ),
         }
         if name not in handlers:
@@ -375,6 +376,7 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
         callback_url: Optional[str] = None,
         callback_api_key: Optional[str] = None,
         timeout_seconds: int = DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS,
+        database_policy: str = "preflight_and_apply",
     ) -> Dict[str, Any]:
         """Lease-aware deploy wrapper around the configured deploy command.
 
@@ -399,6 +401,7 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
             "callback_url": callback_url,
             "callback_api_key": callback_api_key,
             "timeout_seconds": timeout_seconds,
+            "database_policy": database_policy,
         })
 
     return mcp

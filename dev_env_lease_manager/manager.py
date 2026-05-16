@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from .config import LeaseManagerConfig
 from .db import connect, sync_environments
-from .deploy import NativeDeployError, NativeDevDeployer, commit_matches_expected
+from .deploy import DEPLOY_FAILURE_EVENTS, NativeDeployError, NativeDevDeployer, commit_matches_expected, normalize_database_policy
 from .models import (
     ACTIVE_STATUSES,
     ALLOWED_TRANSITIONS,
@@ -395,6 +395,40 @@ class LeaseManager:
             return normalized
         return f"{normalized}/api/v1/external/task-events"
 
+    def _failure_class_from_error(self, error: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(error, dict):
+            return None
+        candidates = [error.get("failure_class")]
+        result = error.get("result")
+        if isinstance(result, dict):
+            candidates.extend([result.get("failure_class"), result.get("error")])
+            deploy = result.get("deploy")
+            if isinstance(deploy, dict):
+                candidates.extend([deploy.get("failure_class"), deploy.get("error")])
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate in DEPLOY_FAILURE_EVENTS:
+                return candidate
+        return None
+
+    def _failure_event_name(self, error: Optional[Dict[str, Any]]) -> str:
+        return self._failure_class_from_error(error) or "deploy_failed"
+
+    def _failure_phase_from_error(self, error: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(error, dict):
+            return None
+        candidates = [error.get("phase")]
+        result = error.get("result")
+        if isinstance(result, dict):
+            candidates.append(result.get("phase"))
+            deploy = result.get("deploy")
+            if isinstance(deploy, dict):
+                candidates.append(deploy.get("phase"))
+        candidates.append(error.get("stage"))
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
+
     def _send_callback(self, queue: Dict[str, Any], event: str, message: str,
                        lease: Optional[Dict[str, Any]] = None,
                        error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -425,6 +459,12 @@ class LeaseManager:
             payload["assigned_environment_id"] = assigned_environment_id
         if error:
             payload["error"] = error
+            failure_class = self._failure_class_from_error(error)
+            if failure_class:
+                payload["failure_class"] = failure_class
+            failure_phase = self._failure_phase_from_error(error)
+            if failure_phase:
+                payload["phase"] = failure_phase
 
         if not callback_url:
             attempt_id = self._record_callback_attempt(
@@ -743,7 +783,8 @@ class LeaseManager:
                                services: str = "both", health_check: bool = True,
                                priority: int = 0, callback_url: Optional[str] = None,
                                callback_api_key: Optional[str] = None,
-                               metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                               metadata: Optional[Dict[str, Any]] = None,
+                               database_policy: str = "preflight_and_apply") -> Dict[str, Any]:
         if not task_id:
             return {"ok": False, "error": "task_id is required"}
         if not actor:
@@ -765,7 +806,7 @@ class LeaseManager:
                 "message": "AGENT_HQ_MCP_API_KEY is required in the lease manager MCP server env when Agent HQ callbacks are configured.",
                 "environment_id": environment_id,
             }
-        queue_metadata = self._request_metadata(env, environment_id, source_repo_path, extra=metadata)
+        queue_metadata = self._request_metadata(env, environment_id, source_repo_path, extra={**(metadata or {}), "database_policy": normalize_database_policy(database_policy)})
         superseded: list[Dict[str, Any]] = []
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1093,7 +1134,8 @@ class LeaseManager:
     def _deploy_acquired_lease(self, env: Dict[str, Any], lease_id: str, environment_id: str,
                                task_id: str, actor: str, source_repo_path: str,
                                commit: Optional[str], services: str, health_check: bool,
-                               dry_run: bool, timeout_seconds: int) -> Dict[str, Any]:
+                               dry_run: bool, timeout_seconds: int,
+                               database_policy: str = "preflight_and_apply") -> Dict[str, Any]:
         if dry_run:
             deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"dry_run": True, "served_commit": commit})
             deployed["deploy"] = {"dry_run": True}
@@ -1122,6 +1164,7 @@ class LeaseManager:
                     health_check=health_check,
                     expected_commit=commit,
                     timeout_seconds=timeout_seconds,
+                    database_policy=database_policy,
                 )
             except NativeDeployError as exc:
                 deploy_payload = exc.payload()
@@ -1171,12 +1214,14 @@ class LeaseManager:
                            dry_run: bool = False, timeout_seconds: int = 1800,
                            queue_if_busy: bool = False, priority: int = 0,
                            callback_url: Optional[str] = None,
-                           callback_api_key: Optional[str] = None) -> Dict[str, Any]:
+                           callback_api_key: Optional[str] = None,
+                           database_policy: str = "preflight_and_apply") -> Dict[str, Any]:
         env = self._environment(environment_id)
         if not env:
             return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
         if not os.path.isdir(source_repo_path):
             return {"ok": False, "error": "source_repo_path_not_found", "source_repo_path": source_repo_path}
+        database_policy = normalize_database_policy(database_policy)
         target_env = env
         target_environment_id = environment_id
         acquire = self.acquire(
@@ -1192,6 +1237,7 @@ class LeaseManager:
                 environment_id,
                 source_repo_path,
                 assigned_environment_id=target_environment_id,
+                extra={"database_policy": database_policy},
             ),
             supersede_same_task_review=True,
         )
@@ -1215,7 +1261,7 @@ class LeaseManager:
                         environment_id,
                         source_repo_path,
                         assigned_environment_id=target_environment_id,
-                        extra={"selected_after_busy_owner": queued_because_owner},
+                        extra={"selected_after_busy_owner": queued_because_owner, "database_policy": database_policy},
                     ),
                     supersede_same_task_review=True,
                 )
@@ -1249,6 +1295,7 @@ class LeaseManager:
                     callback_url=callback_url,
                     callback_api_key=callback_api_key,
                     metadata=metadata,
+                    database_policy=database_policy,
                 )
         if not acquire.get("ok"):
             if superseded_lease:
@@ -1274,7 +1321,7 @@ class LeaseManager:
             error = self._callback_error("mark_deploying", deploying)
             callbacks.append(self._send_callback(
                 callback_queue,
-                "deploy_failed",
+                self._failure_event_name(error),
                 f"Direct deploy lease {lease_id} failed before deployment.",
                 lease=acquire.get("lease"),
                 error=error,
@@ -1302,6 +1349,7 @@ class LeaseManager:
             health_check,
             dry_run,
             timeout_seconds,
+            database_policy,
         )
         latest_lease = self._lease(lease_id) or acquire.get("lease")
         if deployed.get("status") == "deployed_for_qa":
@@ -1316,7 +1364,7 @@ class LeaseManager:
             failure_summary = self._deploy_failure_summary(deployed)
             callbacks.append(self._send_callback(
                 callback_queue,
-                "deploy_failed",
+                self._failure_event_name(error),
                 f"Direct deploy lease {lease_id} failed: {failure_summary}.",
                 lease=latest_lease,
                 error=error,
@@ -1421,7 +1469,7 @@ class LeaseManager:
                 failed_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
                 callbacks.append(self._send_callback(
                     failed_queue,
-                    "deploy_failed",
+                    self._failure_event_name(error),
                     f"Queued deploy {queue['id']} failed before deployment.",
                     lease=lease,
                     error=error,
@@ -1429,6 +1477,8 @@ class LeaseManager:
                 processed.append({"queue": self._public_queue(failed_queue), "result": deploying, "callbacks": callbacks})
                 continue
 
+            queue_metadata = queue.get("metadata") or {}
+            queue_database_policy = normalize_database_policy(str(queue_metadata.get("database_policy") or "preflight_and_apply"))
             result = self._deploy_acquired_lease(
                 env,
                 lease["id"],
@@ -1441,6 +1491,7 @@ class LeaseManager:
                 bool(queue.get("health_check")),
                 dry_run,
                 timeout_seconds,
+                queue_database_policy,
             )
 
             latest_lease = self._lease(lease["id"]) or lease
@@ -1458,7 +1509,7 @@ class LeaseManager:
                 final_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
                 callbacks.append(self._send_callback(
                     final_queue,
-                    "deploy_failed",
+                    self._failure_event_name(error),
                     f"Queued deploy {queue['id']} failed: {failure_summary}.",
                     lease=latest_lease,
                     error=error,

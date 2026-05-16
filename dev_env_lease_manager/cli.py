@@ -111,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy.add_argument("--priority", type=int, default=0)
     deploy.add_argument("--callback-url")
     deploy.add_argument("--callback-api-key")
+    deploy.add_argument("--database-policy", default="preflight_and_apply", choices=["none", "status_only", "preflight_only", "preflight_and_apply"])
 
     return parser
 
@@ -177,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
                 priority=args.priority,
                 callback_url=args.callback_url,
                 callback_api_key=args.callback_api_key,
+                database_policy=args.database_policy,
             ),
         }
         return print_json(command_map[args.command]())
