@@ -95,6 +95,26 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertEqual(second["owner"]["commit"], "abc123")
         self.assertIn("Do not deploy", second["next_action"])
 
+    def test_rejects_qa_fixture_task_ids_before_lease_or_queue_creation(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+
+        acquire = manager.acquire("agent-hq-dev", "999123", "cinder")
+        deploy = manager.lease_aware_deploy("agent-hq-dev", "999123", "cinder", str(source), dry_run=True)
+        queued = manager.enqueue_deploy_request("agent-hq-dev", "999123", "cinder", str(source))
+
+        for result in (acquire, deploy, queued):
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"], "qa_fixture_task_not_deployable")
+            self.assertEqual(result["task_id"], "999123")
+            self.assertIn("QA fixtures", result["message"])
+
+        lease_count = manager.conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0]
+        queue_count = manager.conn.execute("SELECT COUNT(*) FROM deploy_queue").fetchone()[0]
+        self.assertEqual(lease_count, 0)
+        self.assertEqual(queue_count, 0)
+
     def test_concurrent_acquire_allows_one_owner(self) -> None:
         manager, tmp = self.make_manager()
         db_path = manager.config.data_path
@@ -459,6 +479,30 @@ class LeaseManagerTests(ManagerTestCase):
         lease = manager.status()["environments"][0]["active_lease"]
         self.assertEqual(lease["task_id"], "426")
         self.assertEqual(lease["commit_sha"], "queued-commit")
+
+    def test_sweep_deploy_queue_fails_preexisting_qa_fixture_queue(self) -> None:
+        manager, tmp = self.make_manager()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        now = "2026-01-01T00:00:00Z"
+        manager.conn.execute(
+            """
+            INSERT INTO deploy_queue (
+              id, environment_id, task_id, actor, source_repo_path, status,
+              requested_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+            """,
+            ("fixture-queue", "agent-hq-dev", "999456", "cinder", str(source), now, now),
+        )
+
+        result = manager.sweep_deploy_queue("queue-worker", dry_run=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["processed"][0]["queue"]["status"], "failed")
+        self.assertEqual(result["processed"][0]["result"]["error"], "qa_fixture_task_not_deployable")
+        self.assertEqual(result["processed"][0]["result"]["task_id"], "999456")
+        self.assertIsNone(manager.status()["environments"][0]["active_lease"])
 
     def test_release_sweeps_next_queued_request(self) -> None:
         manager, tmp = self.make_manager()

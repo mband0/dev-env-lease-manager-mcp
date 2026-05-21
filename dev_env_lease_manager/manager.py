@@ -26,6 +26,8 @@ from .models import (
 
 
 CALLBACK_SOURCE = "dev_environment_lease_manager"
+QA_FIXTURE_TASK_ID_PREFIX = "999"
+QA_FIXTURE_TASK_ID_LENGTH = 6
 
 
 def utc_now() -> str:
@@ -49,6 +51,27 @@ def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
                 data[out_key] = {} if key != "tags_json" else []
             del data[key]
     return data
+
+
+def is_qa_fixture_task_id(task_id: Any) -> bool:
+    value = str(task_id).strip()
+    return (
+        len(value) == QA_FIXTURE_TASK_ID_LENGTH
+        and value.isascii()
+        and value.isdigit()
+        and value.startswith(QA_FIXTURE_TASK_ID_PREFIX)
+    )
+
+
+def qa_fixture_task_rejection(task_id: Any) -> Dict[str, Any]:
+    task_id_value = str(task_id).strip()
+    return {
+        "ok": False,
+        "error": "qa_fixture_task_not_deployable",
+        "task_id": task_id_value,
+        "message": "Task IDs in the 999XXX range are QA fixtures and cannot be deployed.",
+        "next_action": "Use a real Agent HQ task id before acquiring or deploying a dev environment lease.",
+    }
 
 
 class LeaseManager:
@@ -814,6 +837,9 @@ class LeaseManager:
                 supersede_same_task_review: bool = False) -> Dict[str, Any]:
         if not task_id:
             return {"ok": False, "error": "task_id is required"}
+        task_rejection = qa_fixture_task_rejection(task_id) if is_qa_fixture_task_id(task_id) else None
+        if task_rejection:
+            return task_rejection
         if not actor:
             return {"ok": False, "error": "actor is required"}
         env = self._environment(environment_id)
@@ -909,6 +935,9 @@ class LeaseManager:
                                database_policy: str = "preflight_and_apply") -> Dict[str, Any]:
         if not task_id:
             return {"ok": False, "error": "task_id is required"}
+        task_rejection = qa_fixture_task_rejection(task_id) if is_qa_fixture_task_id(task_id) else None
+        if task_rejection:
+            return task_rejection
         if not actor:
             return {"ok": False, "error": "actor is required"}
         env = self._environment(environment_id)
@@ -1338,6 +1367,9 @@ class LeaseManager:
                            callback_url: Optional[str] = None,
                            callback_api_key: Optional[str] = None,
                            database_policy: str = "preflight_and_apply") -> Dict[str, Any]:
+        task_rejection = qa_fixture_task_rejection(task_id) if is_qa_fixture_task_id(task_id) else None
+        if task_rejection:
+            return task_rejection
         env = self._environment(environment_id)
         if not env:
             return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
@@ -1551,6 +1583,21 @@ class LeaseManager:
             queue = self._next_queued_request(str(env_id))
             if not queue:
                 skipped.append({"environment_id": env_id, "reason": "queue_empty"})
+                continue
+
+            task_rejection = qa_fixture_task_rejection(queue["task_id"]) if is_qa_fixture_task_id(queue["task_id"]) else None
+            if task_rejection:
+                error = self._callback_error("reject_qa_fixture_task", task_rejection)
+                failed_queue = self._set_queue_status(queue["id"], "failed", error=error)
+                callbacks = [
+                    self._send_callback(
+                        failed_queue,
+                        self._failure_event_name(error),
+                        f"Queued deploy {queue['id']} rejected: {task_rejection['message']}",
+                        error=error,
+                    )
+                ]
+                processed.append({"queue": self._public_queue(failed_queue), "result": task_rejection, "callbacks": callbacks})
                 continue
 
             acquire = self.acquire(
