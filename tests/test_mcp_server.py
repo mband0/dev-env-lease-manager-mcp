@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import tempfile
@@ -41,6 +42,21 @@ class McpServerTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["lease"]["task_id"], "426")
+
+    def test_every_tool_call_releases_stale_leases_first(self) -> None:
+        service, manager, _ = self.make_service()
+        lease = manager.acquire("agent-hq-dev", "426", "cinder")["lease"]
+        old = (datetime.now(timezone.utc) - timedelta(hours=3)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        manager.conn.execute("UPDATE leases SET heartbeat_at = ? WHERE id = ?", (old, lease["id"]))
+
+        payload = service.call_tool("dev_env_status", {"environment_id": "agent-hq-dev"})
+
+        self.assertTrue(payload["ok"])
+        self.assertIn("preflight_cleanup", payload)
+        self.assertEqual(payload["preflight_cleanup"]["stale_leases"]["released"][0]["id"], lease["id"])
+        self.assertEqual(manager._lease(lease["id"])["status"], "stale_released")
+        self.assertIsNone(payload["environments"][0]["active_lease"])
+        self.assertTrue(payload["environments"][0]["available"])
 
     def test_named_release_tools_call_state_machine_reasons(self) -> None:
         service, manager, _ = self.make_service()

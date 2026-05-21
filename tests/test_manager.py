@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 
 from dev_env_lease_manager.config import load_config
+from dev_env_lease_manager.deploy import NativeDeployError, NativeDeployLock
 from dev_env_lease_manager.manager import LeaseManager
 
 
@@ -230,6 +233,87 @@ class LeaseManagerTests(ManagerTestCase):
 
         swept = manager.sweep_stale("operator")
         self.assertEqual(swept["marked_stale"][0]["status"], "stale")
+
+    def test_mcp_preflight_cleanup_releases_stale_leases_and_removes_stale_locks(self) -> None:
+        state_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(state_dir, ignore_errors=True))
+        manager, _ = self.make_manager(
+            stale_after_seconds=1,
+            metadata={"state_dir": str(state_dir), "deploy_lock_stale_after_seconds": 1},
+        )
+        lease = manager.acquire("agent-hq-dev", "426", "cinder")["lease"]
+        old = (datetime.now(timezone.utc) - timedelta(seconds=120)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        manager.conn.execute("UPDATE leases SET heartbeat_at = ? WHERE id = ?", (old, lease["id"]))
+        legacy_lock = state_dir / "lock"
+        legacy_lock.mkdir()
+        old_timestamp = datetime.now(timezone.utc).timestamp() - 120
+        os.utime(legacy_lock, (old_timestamp, old_timestamp))
+
+        cleanup = manager.mcp_preflight_cleanup()
+
+        self.assertTrue(cleanup["ok"])
+        self.assertEqual(cleanup["stale_leases"]["released"][0]["status"], "stale_released")
+        self.assertEqual(cleanup["deploy_locks"]["removed"][0]["kind"], "legacy_dir")
+        self.assertFalse(legacy_lock.exists())
+        self.assertTrue(manager.status("agent-hq-dev")["environments"][0]["available"])
+
+    def test_status_reports_native_deploy_lock_and_sweep_removes_stale_legacy_lock(self) -> None:
+        state_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(state_dir, ignore_errors=True))
+        manager, _ = self.make_manager(
+            stale_after_seconds=1,
+            metadata={"state_dir": str(state_dir), "deploy_lock_stale_after_seconds": 1},
+        )
+        legacy_lock = state_dir / "lock"
+        legacy_lock.mkdir()
+        old = datetime.now(timezone.utc).timestamp() - 120
+        os.utime(legacy_lock, (old, old))
+
+        status = manager.status("agent-hq-dev")["environments"][0]
+
+        self.assertFalse(status["available"])
+        self.assertEqual(status["blocked_by"], "native_deploy_lock")
+        self.assertTrue(status["native_deploy_lock"]["blocks_deploy"])
+        self.assertTrue(status["native_deploy_lock"]["stale"])
+
+        swept = manager.sweep_deploy_locks("operator", "stale deploy lock", "agent-hq-dev")
+
+        self.assertTrue(swept["ok"])
+        self.assertEqual(len(swept["removed"]), 1)
+        self.assertFalse(legacy_lock.exists())
+        self.assertTrue(manager.status("agent-hq-dev")["environments"][0]["available"])
+
+    def test_status_reports_active_native_deploy_lock_and_sweep_skips_live_lock(self) -> None:
+        state_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(state_dir, ignore_errors=True))
+        manager, _ = self.make_manager(metadata={"state_dir": str(state_dir)})
+        env = manager.status("agent-hq-dev")["environments"][0]["environment"]
+
+        with NativeDeployLock(str(state_dir), {"environment_id": "agent-hq-dev", "task_id": "426"}, env):
+            status = manager.status("agent-hq-dev")["environments"][0]
+            self.assertFalse(status["available"])
+            self.assertEqual(status["blocked_by"], "native_deploy_lock")
+            self.assertTrue(status["native_deploy_lock"]["blocks_deploy"])
+
+            swept = manager.sweep_deploy_locks("operator", "stale deploy lock", "agent-hq-dev", force=True)
+            self.assertEqual(len(swept["removed"]), 0)
+            self.assertEqual(swept["skipped"][0]["reason"], "lock_is_currently_held")
+
+    def test_native_deploy_lock_refuses_concurrent_holder_with_metadata(self) -> None:
+        state_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(state_dir, ignore_errors=True))
+        manager, _ = self.make_manager(metadata={"state_dir": str(state_dir)})
+        env = manager.status("agent-hq-dev")["environments"][0]["environment"]
+
+        with NativeDeployLock(str(state_dir), {"environment_id": "agent-hq-dev", "task_id": "426"}, env):
+            with self.assertRaises(NativeDeployError) as caught:
+                with NativeDeployLock(str(state_dir), {"environment_id": "agent-hq-dev", "task_id": "427"}, env):
+                    pass
+
+        payload = caught.exception.payload()
+        self.assertEqual(payload["error"], "deploy lock already held")
+        self.assertTrue(payload["deploy_lock"]["blocks_deploy"])
+        self.assertEqual(payload["deploy_lock"]["entries"][0]["metadata"]["task_id"], "426")
 
     def test_validate_qa_detects_commit_mismatch_as_integrity_failure(self) -> None:
         manager, _ = self.make_manager()

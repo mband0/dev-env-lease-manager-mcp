@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -28,6 +31,10 @@ DEPLOY_FAILURE_EVENTS = {
     "checkout_failed",
     "build_failed",
 }
+
+NATIVE_DEPLOY_LOCK_FILE = "deploy.lock"
+LEGACY_NATIVE_DEPLOY_LOCK_DIR = "lock"
+DEFAULT_DEPLOY_LOCK_STALE_AFTER_SECONDS = 7200
 
 
 def normalize_database_policy(value: str | None) -> str:
@@ -92,6 +99,240 @@ def normalize_services(value: str) -> list[str]:
 
 def expand_path(value: str) -> str:
     return str(Path(os.path.expandvars(os.path.expanduser(value))).resolve())
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_time(value: str | None) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def process_alive(pid: object) -> Optional[bool]:
+    try:
+        parsed = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    try:
+        os.kill(parsed, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def native_deploy_state_dir(env: Dict[str, Any]) -> Path:
+    metadata = env.get("metadata") or {}
+    return Path(expand_path(str(metadata.get("state_dir") or "~/.agent-hq-dev-deploy")))
+
+
+def native_deploy_lock_stale_after_seconds(env: Dict[str, Any]) -> int:
+    metadata = env.get("metadata") or {}
+    raw = metadata.get("deploy_lock_stale_after_seconds") or env.get("stale_after_seconds")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_DEPLOY_LOCK_STALE_AFTER_SECONDS
+    return value if value > 0 else DEFAULT_DEPLOY_LOCK_STALE_AFTER_SECONDS
+
+
+def _read_lock_metadata(path: Path) -> Dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"raw": raw[:1000]}
+    return parsed if isinstance(parsed, dict) else {"raw": parsed}
+
+
+def _lock_file_is_held(path: Path) -> bool:
+    try:
+        with path.open("a+", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    return True
+                raise
+            finally:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    except FileNotFoundError:
+        return False
+    return False
+
+
+def _lock_age_seconds(acquired_at: Optional[str], stat_mtime: float, now: Optional[datetime] = None) -> Optional[int]:
+    now_dt = now or datetime.now(timezone.utc)
+    acquired = parse_time(acquired_at)
+    if acquired is None:
+        acquired = datetime.fromtimestamp(stat_mtime, timezone.utc)
+    return max(0, int((now_dt - acquired).total_seconds()))
+
+
+def _lock_entry(path: Path, kind: str, stale_after_seconds: int, now: Optional[datetime] = None) -> Dict[str, Any]:
+    metadata = _read_lock_metadata(path) if path.is_file() else {}
+    stat = path.stat()
+    acquired_at = metadata.get("acquired_at") if isinstance(metadata.get("acquired_at"), str) else None
+    age_seconds = _lock_age_seconds(acquired_at, stat.st_mtime, now)
+    pid_alive = process_alive(metadata.get("pid")) if metadata else None
+    locked = _lock_file_is_held(path) if kind == "file" else False
+    stale = (
+        (pid_alive is False)
+        or (age_seconds is not None and age_seconds > stale_after_seconds)
+        or (kind == "legacy_dir" and age_seconds is not None and age_seconds > stale_after_seconds)
+    )
+    return {
+        "kind": kind,
+        "path": str(path),
+        "locked": locked,
+        "blocks_deploy": locked or kind == "legacy_dir",
+        "stale": stale,
+        "age_seconds": age_seconds,
+        "stale_after_seconds": stale_after_seconds,
+        "pid_alive": pid_alive,
+        "metadata": metadata,
+    }
+
+
+def inspect_native_deploy_lock(env: Dict[str, Any], now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+    state_dir = native_deploy_state_dir(env)
+    stale_after_seconds = native_deploy_lock_stale_after_seconds(env)
+    entries: list[Dict[str, Any]] = []
+    lock_file = state_dir / NATIVE_DEPLOY_LOCK_FILE
+    legacy_lock_dir = state_dir / LEGACY_NATIVE_DEPLOY_LOCK_DIR
+
+    if lock_file.exists():
+        entries.append(_lock_entry(lock_file, "file", stale_after_seconds, now))
+    if legacy_lock_dir.exists():
+        entries.append(_lock_entry(legacy_lock_dir, "legacy_dir", stale_after_seconds, now))
+    if not entries:
+        return None
+
+    return {
+        "state_dir": str(state_dir),
+        "blocks_deploy": any(bool(entry.get("blocks_deploy")) for entry in entries),
+        "stale": any(bool(entry.get("stale")) for entry in entries),
+        "entries": entries,
+    }
+
+
+def sweep_native_deploy_lock(env: Dict[str, Any], actor: str, reason: str, force: bool = False) -> Dict[str, Any]:
+    if not actor:
+        return {"ok": False, "error": "actor is required"}
+    if not reason:
+        return {"ok": False, "error": "reason is required"}
+
+    state_dir = native_deploy_state_dir(env)
+    lock = inspect_native_deploy_lock(env)
+    if not lock:
+        return {"ok": True, "environment_id": env.get("id"), "removed": [], "skipped": []}
+
+    removed: list[Dict[str, Any]] = []
+    skipped: list[Dict[str, Any]] = []
+    for entry in lock["entries"]:
+        path = Path(str(entry["path"]))
+        kind = str(entry["kind"])
+        locked = bool(entry.get("locked"))
+        stale = bool(entry.get("stale"))
+        if locked:
+            skipped.append({**entry, "reason": "lock_is_currently_held"})
+            continue
+        if not (stale or force):
+            skipped.append({**entry, "reason": "lock_not_stale"})
+            continue
+        try:
+            if kind == "legacy_dir":
+                path.rmdir()
+            else:
+                path.unlink()
+            removed.append({**entry, "actor": actor, "reason": reason})
+        except OSError as exc:
+            skipped.append({**entry, "reason": "remove_failed", "error": str(exc)})
+
+    return {
+        "ok": True,
+        "environment_id": env.get("id"),
+        "state_dir": str(state_dir),
+        "removed": removed,
+        "skipped": skipped,
+    }
+
+
+class NativeDeployLock:
+    def __init__(self, state_dir: str, metadata: Dict[str, Any], env: Dict[str, Any]):
+        self.state_dir = Path(state_dir)
+        self.metadata = metadata
+        self.env = env
+        self.path = self.state_dir / NATIVE_DEPLOY_LOCK_FILE
+        self.handle: Optional[Any] = None
+
+    def __enter__(self) -> "NativeDeployLock":
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        legacy_lock_dir = self.state_dir / LEGACY_NATIVE_DEPLOY_LOCK_DIR
+        if legacy_lock_dir.exists():
+            raise NativeDeployError("deploy lock already held", {"deploy_lock": inspect_native_deploy_lock(self.env)})
+
+        self.handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.handle.close()
+            self.handle = None
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise NativeDeployError("deploy lock already held", {"deploy_lock": inspect_native_deploy_lock(self.env)})
+            raise
+
+        payload = {
+            **self.metadata,
+            "pid": os.getpid(),
+            "acquired_at": utc_now(),
+            "lock_file": str(self.path),
+        }
+        self.handle.seek(0)
+        self.handle.truncate()
+        self.handle.write(json.dumps(payload, indent=2, sort_keys=True))
+        self.handle.write("\n")
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if not self.handle:
+            return
+        try:
+            self.handle.seek(0)
+            self.handle.truncate()
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+        finally:
+            try:
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.handle.close()
+                self.handle = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 class NativeDevDeployer:
@@ -474,6 +715,7 @@ class NativeDevDeployer:
         expected_commit: Optional[str] = None,
         timeout_seconds: int = 1800,
         database_policy: str = "preflight_and_apply",
+        lock_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         metadata = env.get("metadata") or {}
         dev_repo_path = env.get("repo_path")
@@ -483,7 +725,6 @@ class NativeDevDeployer:
         canonical_root = expand_path(str(metadata.get("canonical_root") or source_repo_path))
         state_dir = expand_path(str(metadata.get("state_dir") or "~/.agent-hq-dev-deploy"))
         state_file = expand_path(str(metadata.get("state_file") or str(Path(state_dir) / "current-target.json")))
-        lock_dir = Path(state_dir) / "lock"
         api_name = str(metadata.get("pm2_api") or "agent-hq-dev-api")
         ui_name = str(metadata.get("pm2_ui") or "agent-hq-dev-ui")
         api_port = str(metadata.get("api_port") or 3511)
@@ -495,13 +736,15 @@ class NativeDevDeployer:
 
         source_repo_path = expand_path(source_repo_path)
         dev_repo_path = expand_path(str(dev_repo_path))
-        Path(state_dir).mkdir(parents=True, exist_ok=True)
-        try:
-            lock_dir.mkdir()
-        except FileExistsError:
-            raise NativeDeployError("deploy lock already held")
 
-        try:
+        lock_payload = {
+            "environment_id": env.get("id"),
+            "source_repo_path": source_repo_path,
+            "expected_commit": expected_commit,
+            "services": service_list,
+            **(lock_metadata or {}),
+        }
+        with NativeDeployLock(state_dir, lock_payload, env):
             if not Path(source_repo_path).is_dir():
                 raise NativeDeployError("repo_path does not exist")
             if not Path(canonical_root).is_dir():
@@ -635,8 +878,3 @@ class NativeDevDeployer:
                 "database_migration": migration_setup if "api" in service_list else None,
                 "health": health,
             }
-        finally:
-            try:
-                lock_dir.rmdir()
-            except OSError:
-                pass

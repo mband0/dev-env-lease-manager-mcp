@@ -16,6 +16,18 @@ class LeaseManagerMcpTools:
     def __init__(self, manager: LeaseManager):
         self.manager = manager
 
+    def _preflight_cleanup_has_reportable_changes(self, cleanup: Dict[str, Any]) -> bool:
+        stale_leases = cleanup.get("stale_leases") or {}
+        deploy_locks = cleanup.get("deploy_locks") or {}
+        return (
+            not bool(cleanup.get("ok", False))
+            or bool(stale_leases.get("marked_stale"))
+            or bool(stale_leases.get("released"))
+            or bool(stale_leases.get("skipped"))
+            or bool(deploy_locks.get("removed"))
+            or any(bool(entry.get("stale")) for entry in deploy_locks.get("skipped", []))
+        )
+
     def call_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         handlers: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
             "dev_env_health": lambda a: {
@@ -70,6 +82,12 @@ class LeaseManagerMcpTools:
                 bool(a.get("dry_run", False)),
                 int(a.get("timeout_seconds") or DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS),
             ),
+            "dev_env_sweep_deploy_locks": lambda a: self.manager.sweep_deploy_locks(
+                a["actor"],
+                a["reason"],
+                a.get("environment_id"),
+                bool(a.get("force", False)),
+            ),
             "dev_env_cancel_queue": lambda a: self.manager.cancel_queue_request(
                 a["queue_id"],
                 a["actor"],
@@ -112,7 +130,11 @@ class LeaseManagerMcpTools:
         if name not in handlers:
             return {"ok": False, "error": "unknown_tool", "tool": name}
         try:
-            return handlers[name](args or {})
+            preflight_cleanup = self.manager.mcp_preflight_cleanup()
+            result = handlers[name](args or {})
+            if self._preflight_cleanup_has_reportable_changes(preflight_cleanup):
+                result["preflight_cleanup"] = preflight_cleanup
+            return result
         except KeyError as exc:
             return {"ok": False, "error": "missing_required_argument", "argument": str(exc).strip("'")}
         except Exception as exc:
@@ -306,6 +328,21 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
             "limit": limit,
             "dry_run": dry_run,
             "timeout_seconds": timeout_seconds,
+        })
+
+    @mcp.tool()
+    def dev_env_sweep_deploy_locks(
+        actor: str,
+        reason: str,
+        environment_id: Optional[str] = None,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Clear stale native deploy lock artifacts when no live deploy owns them."""
+        return service.call_tool("dev_env_sweep_deploy_locks", {
+            "actor": actor,
+            "reason": reason,
+            "environment_id": environment_id,
+            "force": force,
         })
 
     @mcp.tool()

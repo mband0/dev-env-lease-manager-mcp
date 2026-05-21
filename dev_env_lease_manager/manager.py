@@ -14,7 +14,15 @@ from uuid import uuid4
 
 from .config import LeaseManagerConfig
 from .db import connect, sync_environments
-from .deploy import DEPLOY_FAILURE_EVENTS, NativeDeployError, NativeDevDeployer, commit_matches_expected, normalize_database_policy
+from .deploy import (
+    DEPLOY_FAILURE_EVENTS,
+    NativeDeployError,
+    NativeDevDeployer,
+    commit_matches_expected,
+    inspect_native_deploy_lock,
+    normalize_database_policy,
+    sweep_native_deploy_lock,
+)
 from .models import (
     ACTIVE_STATUSES,
     ALLOWED_TRANSITIONS,
@@ -118,7 +126,8 @@ class LeaseManager:
 
     def _available_environment_for_request(self, requested_environment_id: str) -> Optional[Dict[str, Any]]:
         for env in self._candidate_environments_for_request(requested_environment_id):
-            if not self._active_lease(str(env["id"])):
+            deploy_lock = inspect_native_deploy_lock(env)
+            if not self._active_lease(str(env["id"])) and not (deploy_lock and deploy_lock.get("blocks_deploy")):
                 return env
         return None
 
@@ -176,6 +185,22 @@ class LeaseManager:
             """,
             (environment_id, *sorted(ACTIVE_STATUSES)),
         ).fetchone())
+
+    def _lease_is_stale(self, lease: Optional[Dict[str, Any]], env: Optional[Dict[str, Any]],
+                        now_dt: Optional[datetime] = None) -> bool:
+        if not lease or not env:
+            return False
+        if lease.get("status") == "stale":
+            return True
+        heartbeat_at = lease.get("heartbeat_at")
+        if not heartbeat_at:
+            return False
+        try:
+            heartbeat_dt = parse_time(str(heartbeat_at))
+        except ValueError:
+            return False
+        now_value = now_dt or parse_time(utc_now())
+        return (now_value - heartbeat_dt).total_seconds() > int(env["stale_after_seconds"])
 
     def _lease(self, lease_id: str) -> Optional[Dict[str, Any]]:
         return row_to_dict(self.conn.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone())
@@ -1190,22 +1215,94 @@ class LeaseManager:
             if not env:
                 continue
             lease = self._active_lease(env["id"])
-            stale = False
-            if lease and lease.get("heartbeat_at"):
-                stale = (now_dt - parse_time(lease["heartbeat_at"])).total_seconds() > int(env["stale_after_seconds"])
+            stale = self._lease_is_stale(lease, env, now_dt)
             queue_entries = self._queue_entries(env["id"])
+            deploy_lock = inspect_native_deploy_lock(env)
+            deploy_lock_blocks = bool(deploy_lock and deploy_lock.get("blocks_deploy"))
             item = {
                 "environment": env,
-                "available": lease is None,
+                "available": lease is None and not deploy_lock_blocks,
                 "active_lease": lease,
                 "stale": stale,
                 "queue": queue_entries,
                 "queue_depth": len([entry for entry in queue_entries if entry.get("status") == "queued"]),
             }
+            if deploy_lock:
+                item["native_deploy_lock"] = deploy_lock
+            if deploy_lock_blocks:
+                item["blocked_by"] = "native_deploy_lock"
             if include_events and lease:
                 item["events"] = self.events(lease["id"])["events"]
             output.append(item)
         return {"ok": True, "environments": output}
+
+    def sweep_deploy_locks(
+        self,
+        actor: str,
+        reason: str,
+        environment_id: Optional[str] = None,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        if not actor:
+            return {"ok": False, "error": "actor is required"}
+        if not reason:
+            return {"ok": False, "error": "reason is required"}
+        envs = [self._environment(environment_id)] if environment_id else self._environments()
+        results = []
+        for env in envs:
+            if not env:
+                results.append({"ok": False, "environment_id": environment_id, "error": "environment_not_found"})
+                continue
+            results.append(sweep_native_deploy_lock(env, actor, reason, force))
+        return {
+            "ok": all(result.get("ok") for result in results),
+            "results": results,
+            "removed": [entry for result in results for entry in result.get("removed", [])],
+            "skipped": [entry for result in results for entry in result.get("skipped", [])],
+        }
+
+    def release_stale_leases(self, actor: str, message: Optional[str] = None) -> Dict[str, Any]:
+        if not actor:
+            return {"ok": False, "error": "actor is required"}
+        now_dt = parse_time(utc_now())
+        marked = []
+        released = []
+        skipped = []
+        for env in self._environments():
+            lease = self._active_lease(str(env["id"]))
+            if not self._lease_is_stale(lease, env, now_dt):
+                continue
+            if not lease:
+                continue
+            if lease["status"] != "stale":
+                self.conn.execute("UPDATE leases SET status = 'stale' WHERE id = ?", (lease["id"],))
+                self._event(lease["id"], lease["environment_id"], lease["task_id"], actor, "mark_stale", lease["status"], "stale")
+                lease = self._lease(lease["id"])
+                if lease:
+                    marked.append(lease)
+            if not lease:
+                continue
+            result = self.release(
+                lease["id"],
+                actor,
+                "stale_released",
+                message or "stale lease released by MCP preflight cleanup",
+                sweep_queue_after_release=False,
+            )
+            if result.get("ok"):
+                released.append(result.get("lease"))
+            else:
+                skipped.append({"lease_id": lease["id"], "environment_id": env["id"], "result": result})
+        return {"ok": True, "marked_stale": marked, "released": released, "skipped": skipped}
+
+    def mcp_preflight_cleanup(self, actor: str = "mcp:auto-sweep") -> Dict[str, Any]:
+        stale_leases = self.release_stale_leases(actor)
+        deploy_locks = self.sweep_deploy_locks(actor, "mcp preflight stale deploy lock cleanup")
+        return {
+            "ok": bool(stale_leases.get("ok")) and bool(deploy_locks.get("ok")),
+            "stale_leases": stale_leases,
+            "deploy_locks": deploy_locks,
+        }
 
     def events(self, lease_id: str) -> Dict[str, Any]:
         rows = self.conn.execute("SELECT * FROM lease_events WHERE lease_id = ? ORDER BY id", (lease_id,)).fetchall()
@@ -1308,6 +1405,7 @@ class LeaseManager:
                 return released
         else:
             try:
+                current_lease = self._lease(lease_id) or {}
                 deploy_payload = NativeDevDeployer().deploy(
                     env,
                     source_repo_path,
@@ -1316,6 +1414,13 @@ class LeaseManager:
                     expected_commit=commit,
                     timeout_seconds=timeout_seconds,
                     database_policy=database_policy,
+                    lock_metadata={
+                        "lease_id": lease_id,
+                        "task_id": task_id,
+                        "actor": actor,
+                        "branch": current_lease.get("branch"),
+                        "commit": commit,
+                    },
                 )
             except NativeDeployError as exc:
                 deploy_payload = exc.payload()
@@ -1579,6 +1684,10 @@ class LeaseManager:
             active = self._active_lease(str(env_id))
             if active:
                 skipped.append({"environment_id": env_id, "reason": "environment_busy", "lease": active})
+                continue
+            deploy_lock = inspect_native_deploy_lock(env)
+            if deploy_lock and deploy_lock.get("blocks_deploy"):
+                skipped.append({"environment_id": env_id, "reason": "native_deploy_lock", "native_deploy_lock": deploy_lock})
                 continue
             queue = self._next_queued_request(str(env_id))
             if not queue:

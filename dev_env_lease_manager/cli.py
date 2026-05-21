@@ -74,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_queue.add_argument("--limit", type=int, default=1)
     sweep_queue.add_argument("--dry-run", action="store_true")
 
+    sweep_locks = sub.add_parser("sweep-deploy-locks")
+    sweep_locks.add_argument("--actor", required=True)
+    sweep_locks.add_argument("--reason", required=True)
+    sweep_locks.add_argument("--environment-id")
+    sweep_locks.add_argument("--force", action="store_true")
+
     cancel_queue = sub.add_parser("cancel-queue")
     cancel_queue.add_argument("--queue-id", required=True)
     cancel_queue.add_argument("--actor", required=True)
@@ -151,6 +157,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.environment_id,
                 args.limit,
                 args.dry_run,
+            ),
+            "sweep-deploy-locks": lambda: manager.sweep_deploy_locks(
+                args.actor,
+                args.reason,
+                args.environment_id,
+                args.force,
             ),
             "cancel-queue": lambda: manager.cancel_queue_request(args.queue_id, args.actor, args.message),
             "events": lambda: manager.events(args.lease_id),

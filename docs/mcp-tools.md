@@ -6,6 +6,12 @@ The server runs over MCP stdio:
 .venv/bin/dev-env-lease-mcp --config config/environments.json
 ```
 
+Every MCP tool call first runs a preflight cleanup. The cleanup releases
+heartbeat-expired active leases as `stale_released` and removes stale native
+deploy lock artifacts when no live deploy process owns the lock. If cleanup
+changes anything, the tool response includes `preflight_cleanup` with the
+released leases and removed lock entries.
+
 ## Tools
 
 - `dev_env_health`
@@ -24,6 +30,7 @@ The server runs over MCP stdio:
 - `dev_env_heartbeat`
 - `dev_env_sweep_stale`
 - `dev_env_sweep_deploy_queue`
+- `dev_env_sweep_deploy_locks`
 - `dev_env_cancel_queue`
 - `dev_env_validate_qa`
 - `dev_env_events`
@@ -60,6 +67,15 @@ environment, and preserves the original queue-time blocker as
 `queued_because_owner` for audit/debugging. `dev_env_cancel_queue` cancels a
 request that has not started, and `dev_env_sweep_deploy_queue` deploys the next
 queued request for an available matching environment.
+
+Native deploys use an OS-level `deploy.lock` file under the environment
+`metadata.state_dir`. The lock records pid, acquired time, environment, lease,
+task, actor, branch, and commit, and the OS releases the lock if the deploy
+process dies. `dev_env_status` reports `native_deploy_lock` when a deploy lock
+or legacy lock directory exists; environments blocked by a live native deploy
+report `blocked_by: native_deploy_lock`. Use `dev_env_sweep_deploy_locks` with
+an explicit actor and reason to remove stale artifacts only when no live deploy
+owns the lock, or with `force` for non-held legacy/unlocked artifacts.
 
 Queued deploys can call Agent HQ's external task event endpoint. Provide
 `callback_url` as either the Agent HQ base URL or

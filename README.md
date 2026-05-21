@@ -32,8 +32,19 @@ python3.11 -m venv .venv
 .venv/bin/dev-env-lease force-release --environment-id agent-hq-dev --actor operator:admin --reason stale
 .venv/bin/dev-env-lease queue-status --environment-id agent-hq-dev
 .venv/bin/dev-env-lease sweep-deploy-queue --environment-id agent-hq-dev --actor queue-worker
+.venv/bin/dev-env-lease sweep-deploy-locks --environment-id agent-hq-dev --actor operator:admin --reason stale-native-lock
 .venv/bin/dev-env-lease callback-attempts --task-id 448
 ```
+
+Native deploys use an OS-level `deploy.lock` file in each environment state
+directory. `status` reports live or stale native deploy locks, and
+`sweep-deploy-locks` removes stale lock artifacts only with an explicit actor
+and reason.
+
+Every MCP tool call runs a preflight cleanup before executing the requested
+tool. That cleanup releases heartbeat-expired leases as `stale_released` and
+removes stale native deploy lock artifacts when no live deploy process owns
+them.
 
 See [docs/lease-contract.md](docs/lease-contract.md) for the contract, state
 machine, and MCP payloads. See
