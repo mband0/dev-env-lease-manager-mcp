@@ -45,6 +45,48 @@
         "pm2_ui": "agent-hq-dev-2-ui",
         "dev_db_path": "~/agent-hq-dev-2/agent-hq-dev-2.db"
       }
+    },
+    {
+      "id": "ecopool-dev",
+      "label": "Ecopool Dev",
+      "base_url": "http://127.0.0.1:3610",
+      "health_url": "http://127.0.0.1:3610/health",
+      "repo_path": "~/ecopool-dev",
+      "deploy_command": "ECOPOOL_PORT=3610 ECOPOOL_PM2_NAME=ecopool-dev ECOPOOL_STATE_DIR=~/.ecopool-dev-deploy /Users/nordini/dev-environment-lease-manager/.venv/bin/python /Users/nordini/dev-environment-lease-manager/scripts/deploy_ecopool_worktree.py",
+      "served_commit_command": "git -C ~/ecopool-dev rev-parse HEAD",
+      "stale_after_seconds": 7200,
+      "tags": ["ecopool", "dev", "shared-checkout"],
+      "metadata": {
+        "deploy_mode": "command",
+        "canonical_root": "https://github.com/nord-initiatives/ecopool",
+        "state_dir": "~/.ecopool-dev-deploy",
+        "deploy_lock_stale_after_seconds": 7200,
+        "api_port": 3610,
+        "ui_port": 3610,
+        "pm2_api": "ecopool-dev",
+        "pm2_ui": "ecopool-dev"
+      }
+    },
+    {
+      "id": "ecopool-dev-2",
+      "label": "Ecopool Dev 2",
+      "base_url": "http://127.0.0.1:3620",
+      "health_url": "http://127.0.0.1:3620/health",
+      "repo_path": "~/ecopool-dev-2",
+      "deploy_command": "ECOPOOL_PORT=3620 ECOPOOL_PM2_NAME=ecopool-dev-2 ECOPOOL_STATE_DIR=~/.ecopool-dev-2-deploy /Users/nordini/dev-environment-lease-manager/.venv/bin/python /Users/nordini/dev-environment-lease-manager/scripts/deploy_ecopool_worktree.py",
+      "served_commit_command": "git -C ~/ecopool-dev-2 rev-parse HEAD",
+      "stale_after_seconds": 7200,
+      "tags": ["ecopool", "dev", "shared-checkout"],
+      "metadata": {
+        "deploy_mode": "command",
+        "canonical_root": "https://github.com/nord-initiatives/ecopool",
+        "state_dir": "~/.ecopool-dev-2-deploy",
+        "deploy_lock_stale_after_seconds": 7200,
+        "api_port": 3620,
+        "ui_port": 3620,
+        "pm2_api": "ecopool-dev-2",
+        "pm2_ui": "ecopool-dev-2"
+      }
     }
   ]
 }
