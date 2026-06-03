@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import tempfile
 import unittest
 
@@ -282,6 +284,59 @@ class NativeDeployTests(unittest.TestCase):
         pm2_delete = commands.index(["pm2", "delete", "agent-hq-dev-api"])
         self.assertLess(migrate_preflight, pm2_delete)
         self.assertLess(migrate_apply, pm2_delete)
+
+    def test_database_backup_retains_only_latest_snapshot_by_default(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        db_path = root / "agent-hq-dev.db"
+        backup_dir = root / "db-backups"
+        backup_dir.mkdir()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY)")
+            conn.execute("INSERT INTO tasks (id) VALUES (1)")
+
+        old_backup = backup_dir / "agent-hq-dev.db.100.oldoldoldold.bak"
+        old_backup.write_text("old", encoding="utf-8")
+        old_sidecar = backup_dir / "agent-hq-dev.db.100.oldoldoldold.bak-journal"
+        old_sidecar.write_text("journal", encoding="utf-8")
+        unrelated_backup = backup_dir / "other.db.100.oldoldoldold.bak"
+        unrelated_backup.write_text("other", encoding="utf-8")
+        old_time = 1_700_000_000
+        os.utime(old_backup, (old_time, old_time))
+        os.utime(old_sidecar, (old_time, old_time))
+
+        result = NativeDevDeployer()._backup_database(str(db_path), str(backup_dir), "abc123456789")
+
+        self.assertIsNotNone(result)
+        retained = list(backup_dir.glob("agent-hq-dev.db.*.bak"))
+        self.assertEqual(retained, [Path(result["path"])])
+        self.assertFalse(old_backup.exists())
+        self.assertFalse(old_sidecar.exists())
+        self.assertTrue(unrelated_backup.exists())
+        self.assertEqual(result["retained_count"], 1)
+        self.assertIn(str(old_backup), result["pruned"])
+        self.assertIn(str(old_sidecar), result["pruned"])
+
+    def test_database_backup_can_retain_extra_snapshots_when_configured(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        db_path = root / "agent-hq-dev.db"
+        backup_dir = root / "db-backups"
+        backup_dir.mkdir()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY)")
+
+        first = NativeDevDeployer()._backup_database(str(db_path), str(backup_dir), "111111111111", retain_count=2)
+        second = NativeDevDeployer()._backup_database(str(db_path), str(backup_dir), "222222222222", retain_count=2)
+        third = NativeDevDeployer()._backup_database(str(db_path), str(backup_dir), "333333333333", retain_count=2)
+
+        retained = sorted(path.name for path in backup_dir.glob("agent-hq-dev.db.*.bak"))
+        self.assertEqual(len(retained), 2)
+        self.assertNotIn(Path(first["path"]).name, retained)
+        self.assertIn(Path(second["path"]).name, retained)
+        self.assertIn(Path(third["path"]).name, retained)
 
     def test_database_migration_preflight_failure_does_not_restart_api(self) -> None:
         _, source, dev, canonical = self.make_layout()

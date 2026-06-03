@@ -35,6 +35,7 @@ DEPLOY_FAILURE_EVENTS = {
 NATIVE_DEPLOY_LOCK_FILE = "deploy.lock"
 LEGACY_NATIVE_DEPLOY_LOCK_DIR = "lock"
 DEFAULT_DEPLOY_LOCK_STALE_AFTER_SECONDS = 7200
+DEFAULT_DATABASE_BACKUP_RETAIN_COUNT = 1
 
 
 def normalize_database_policy(value: str | None) -> str:
@@ -143,6 +144,16 @@ def native_deploy_lock_stale_after_seconds(env: Dict[str, Any]) -> int:
     except (TypeError, ValueError):
         value = DEFAULT_DEPLOY_LOCK_STALE_AFTER_SECONDS
     return value if value > 0 else DEFAULT_DEPLOY_LOCK_STALE_AFTER_SECONDS
+
+
+def database_backup_retain_count(env: Dict[str, Any]) -> int:
+    metadata = env.get("metadata") or {}
+    raw = metadata.get("database_backup_retain_count")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_DATABASE_BACKUP_RETAIN_COUNT
+    return value if value > 0 else DEFAULT_DATABASE_BACKUP_RETAIN_COUNT
 
 
 def _read_lock_metadata(path: Path) -> Dict[str, Any]:
@@ -645,13 +656,53 @@ class NativeDevDeployer:
                 },
             )
 
-    def _backup_database(self, db_path: str, backup_dir: str, source_sha: str) -> str | None:
+    def _prune_database_backups(self, backup_dir: str, db_name: str, retain_count: int) -> list[str]:
+        retain_count = max(1, retain_count)
+        root = Path(backup_dir)
+        if not root.exists():
+            return []
+
+        prefix = f"{db_name}."
+        backups = sorted(
+            (
+                candidate for candidate in root.iterdir()
+                if candidate.is_file()
+                and candidate.name.startswith(prefix)
+                and candidate.name.endswith(".bak")
+            ),
+            key=lambda candidate: (candidate.stat().st_mtime, candidate.name),
+            reverse=True,
+        )
+        retained = {candidate.name for candidate in backups[:retain_count]}
+        pruned: list[str] = []
+        for candidate in backups[retain_count:]:
+            candidate.unlink()
+            pruned.append(str(candidate))
+
+        # SQLite can leave journal sidecars after interrupted backups. They are
+        # not useful as retained restore points, so remove them with old/orphaned backups.
+        for sidecar in root.iterdir():
+            if not sidecar.is_file():
+                continue
+            if not sidecar.name.startswith(prefix):
+                continue
+            if ".bak-" not in sidecar.name:
+                continue
+            backup_name = sidecar.name.split(".bak-", 1)[0] + ".bak"
+            if backup_name not in retained:
+                sidecar.unlink()
+                pruned.append(str(sidecar))
+
+        return pruned
+
+    def _backup_database(self, db_path: str, backup_dir: str, source_sha: str, retain_count: int = DEFAULT_DATABASE_BACKUP_RETAIN_COUNT) -> dict[str, Any] | None:
         source = Path(db_path)
         if not source.exists():
             return None
         backup_path = Path(backup_dir) / f"{source.name}.{int(time.time())}.{source_sha[:12]}.bak"
         self._copy_sqlite_snapshot(db_path, str(backup_path), "backup")
-        return str(backup_path)
+        pruned = self._prune_database_backups(backup_dir, source.name, retain_count)
+        return {"path": str(backup_path), "retained_count": max(1, retain_count), "pruned": pruned}
 
     def _run_database_migrations(
         self,
@@ -661,6 +712,7 @@ class NativeDevDeployer:
         api_port: str,
         source_sha: str,
         database_policy: str,
+        backup_retain_count: int,
         timeout_seconds: int,
     ) -> Dict[str, Any]:
         policy = normalize_database_policy(database_policy)
@@ -697,8 +749,12 @@ class NativeDevDeployer:
                 {"failure_class": "database_migration_failed", "phase": "apply", "detail": "api/package.json missing db:migrate script"},
             )
 
-        backup_path = self._backup_database(db_path, backup_dir, source_sha)
-        result["backup_path"] = backup_path
+        backup = self._backup_database(db_path, backup_dir, source_sha, backup_retain_count)
+        result["backup_path"] = backup["path"] if backup else None
+        result["backup_retention"] = {
+            "retain_count": max(1, backup_retain_count),
+            "pruned": backup["pruned"] if backup else [],
+        }
         result["apply"] = self._run_migration_script(api_dir, "db:migrate", db_path, api_port, timeout_seconds)
         result["apply_integrity"] = self._sqlite_integrity_check(db_path, "apply")
         result["applied"] = True
@@ -741,6 +797,7 @@ class NativeDevDeployer:
         ui_port = str(metadata.get("ui_port") or 3510)
         dev_db_path = expand_path(str(metadata.get("dev_db_path") or str(Path(dev_repo_path) / "agent-hq-dev.db")))
         backup_dir = expand_path(str(metadata.get("backup_dir") or str(Path(state_dir) / "db-backups")))
+        backup_retain_count = database_backup_retain_count(env)
         database_policy = normalize_database_policy(str(metadata.get("database_policy") or database_policy))
         service_list = normalize_services(services)
 
@@ -824,6 +881,7 @@ class NativeDevDeployer:
                     api_port,
                     source_sha,
                     database_policy,
+                    backup_retain_count,
                     timeout_seconds,
                 )
                 report_phase("database_migrated")
