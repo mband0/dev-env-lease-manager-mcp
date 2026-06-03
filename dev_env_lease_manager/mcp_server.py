@@ -107,6 +107,17 @@ class LeaseManagerMcpTools:
                 a.get("environment_id"),
                 int(a.get("limit") or 50),
             ),
+            "dev_env_cleanup_task_branch": lambda a: self.manager.cleanup_task_branch(
+                a["repo_path"],
+                a["source_branch"],
+                a["source_commit"],
+                a["deployed_commit"],
+                a["actor"],
+                a.get("remote", "origin"),
+                bool(a.get("dry_run", True)),
+                bool(a.get("delete_local", True)),
+                bool(a.get("delete_remote", True)),
+            ),
             "dev_env_deploy_worktree": lambda a: self.manager.lease_aware_deploy(
                 a["environment_id"],
                 a["task_id"],
@@ -393,6 +404,37 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
             "task_id": task_id,
             "environment_id": environment_id,
             "limit": limit,
+        })
+
+    @mcp.tool()
+    def dev_env_cleanup_task_branch(
+        repo_path: str,
+        source_branch: str,
+        source_commit: str,
+        deployed_commit: str,
+        actor: str,
+        remote: str = "origin",
+        dry_run: bool = True,
+        delete_local: bool = True,
+        delete_remote: bool = True,
+    ) -> Dict[str, Any]:
+        """Safely delete a released task branch after deployed history retains it.
+
+        The tool validates protected branch names, commit ancestry, branch tip
+        drift, active leases, and worktrees before deletion. Dry run is the
+        default and returns the same safety report and planned actions without
+        deleting local or remote branches.
+        """
+        return service.call_tool("dev_env_cleanup_task_branch", {
+            "repo_path": repo_path,
+            "source_branch": source_branch,
+            "source_commit": source_commit,
+            "deployed_commit": deployed_commit,
+            "actor": actor,
+            "remote": remote,
+            "dry_run": dry_run,
+            "delete_local": delete_local,
+            "delete_remote": delete_remote,
         })
 
     @mcp.tool()

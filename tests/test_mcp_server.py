@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -24,6 +25,58 @@ class McpServerTests(unittest.TestCase):
         manager = LeaseManager(load_config(str(config_path)))
         self.addCleanup(manager.close)
         return LeaseManagerMcpTools(manager), manager, tmp
+
+    def git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.returncode != 0:
+            self.fail(f"git {' '.join(args)} failed: {completed.stderr}")
+        return completed
+
+    def run_git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        completed = subprocess.run(
+            ["git", *args],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.returncode != 0:
+            self.fail(f"git {' '.join(args)} failed: {completed.stderr}")
+        return completed
+
+    def commit_file(self, repo: Path, rel_path: str, content: str, message: str) -> str:
+        path = repo / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        self.git(repo, "add", rel_path)
+        self.git(repo, "commit", "-m", message)
+        return self.git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def make_cleanup_repo(self, tmp: tempfile.TemporaryDirectory[str]) -> tuple[Path, str, str, str]:
+        root = Path(tmp.name)
+        remote = root / "remote.git"
+        repo = root / "repo"
+        self.run_git("init", "--bare", str(remote))
+        self.run_git("init", str(repo))
+        self.git(repo, "config", "user.email", "test@example.com")
+        self.git(repo, "config", "user.name", "Test User")
+        self.git(repo, "checkout", "-b", "main")
+        initial = self.commit_file(repo, "README.md", "initial\n", "initial")
+        self.git(repo, "remote", "add", "origin", str(remote))
+        self.git(repo, "push", "-u", "origin", "main")
+        self.git(repo, "checkout", "-b", "task-679")
+        source = self.commit_file(repo, "feature.txt", "feature\n", "task 679 feature")
+        self.git(repo, "push", "origin", "task-679")
+        self.git(repo, "checkout", "main")
+        self.git(repo, "merge", "--ff-only", "task-679")
+        deployed = self.git(repo, "rev-parse", "HEAD").stdout.strip()
+        return repo, initial, source, deployed
 
     def test_creates_fastmcp_server(self) -> None:
         _, manager, _ = self.make_service()
@@ -140,6 +193,158 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(payload["exception_type"], "RuntimeError")
         self.assertEqual(payload["message"], "database locked")
         self.assertIn("RuntimeError: database locked", payload["traceback"])
+
+    def test_cleanup_task_branch_dry_run_and_real_cleanup(self) -> None:
+        service, _, tmp = self.make_service()
+        repo, _, source, deployed = self.make_cleanup_repo(tmp)
+
+        dry_run = service.call_tool("dev_env_cleanup_task_branch", {
+            "repo_path": str(repo),
+            "source_branch": "task-679",
+            "source_commit": source,
+            "deployed_commit": deployed,
+            "actor": "release-agent",
+            "dry_run": True,
+        })
+
+        self.assertTrue(dry_run["ok"], dry_run)
+        self.assertEqual(dry_run["status"], "dry_run")
+        self.assertEqual(
+            {(action["target"], action["action"]) for action in dry_run["planned_actions"]},
+            {("local", "delete_branch"), ("remote", "delete_branch")},
+        )
+        self.assertTrue(dry_run["local"]["exists"])
+        self.assertTrue(dry_run["remote_status"]["exists"])
+        self.git(repo, "show-ref", "--verify", "refs/heads/task-679")
+        self.assertIn(source, self.git(repo, "ls-remote", "--heads", "origin", "task-679").stdout)
+
+        cleaned = service.call_tool("dev_env_cleanup_task_branch", {
+            "repo_path": str(repo),
+            "source_branch": "task-679",
+            "source_commit": source,
+            "deployed_commit": deployed,
+            "actor": "release-agent",
+            "dry_run": False,
+        })
+
+        self.assertTrue(cleaned["ok"], cleaned)
+        self.assertEqual(cleaned["status"], "cleaned")
+        self.assertEqual(
+            {(action["target"], action["action"]) for action in cleaned["performed_actions"]},
+            {("local", "delete_branch"), ("remote", "delete_branch")},
+        )
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "-C", str(repo), "show-ref", "--verify", "refs/heads/task-679"],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).returncode,
+            0,
+        )
+        self.assertEqual(self.git(repo, "ls-remote", "--heads", "origin", "task-679").stdout.strip(), "")
+
+        idempotent = service.call_tool("dev_env_cleanup_task_branch", {
+            "repo_path": str(repo),
+            "source_branch": "task-679",
+            "source_commit": source,
+            "deployed_commit": deployed,
+            "actor": "release-agent",
+            "dry_run": False,
+        })
+
+        self.assertTrue(idempotent["ok"], idempotent)
+        self.assertEqual(idempotent["status"], "cleaned")
+        self.assertEqual(idempotent["local"]["planned_action"], "already_missing")
+        self.assertEqual(idempotent["remote_status"]["planned_action"], "already_missing")
+
+    def test_cleanup_task_branch_refuses_protected_branch(self) -> None:
+        service, _, tmp = self.make_service()
+        repo, _, source, deployed = self.make_cleanup_repo(tmp)
+
+        payload = service.call_tool("dev_env_cleanup_task_branch", {
+            "repo_path": str(repo),
+            "source_branch": "main",
+            "source_commit": source,
+            "deployed_commit": deployed,
+            "actor": "release-agent",
+        })
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "unsafe_branch_cleanup_refused")
+        self.assertIn("protected_branch_refused", {error["error"] for error in payload["errors"]})
+
+    def test_cleanup_task_branch_refuses_source_commit_missing_from_deployed_history(self) -> None:
+        service, _, tmp = self.make_service()
+        repo, initial, source, _ = self.make_cleanup_repo(tmp)
+
+        payload = service.call_tool("dev_env_cleanup_task_branch", {
+            "repo_path": str(repo),
+            "source_branch": "task-679",
+            "source_commit": source,
+            "deployed_commit": initial,
+            "actor": "release-agent",
+        })
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "unsafe_branch_cleanup_refused")
+        self.assertIn("source_commit_not_retained_in_deployed_history", {error["error"] for error in payload["errors"]})
+
+    def test_cleanup_task_branch_refuses_branch_tip_drift(self) -> None:
+        service, _, tmp = self.make_service()
+        repo, _, source, deployed = self.make_cleanup_repo(tmp)
+        self.git(repo, "checkout", "task-679")
+        self.commit_file(repo, "drift.txt", "drift\n", "branch drift")
+        self.git(repo, "push", "origin", "task-679")
+        self.git(repo, "checkout", "main")
+
+        payload = service.call_tool("dev_env_cleanup_task_branch", {
+            "repo_path": str(repo),
+            "source_branch": "task-679",
+            "source_commit": source,
+            "deployed_commit": deployed,
+            "actor": "release-agent",
+        })
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "unsafe_branch_cleanup_refused")
+        self.assertIn("local_branch_tip_not_safe", {error["error"] for error in payload["errors"]})
+
+    def test_cleanup_task_branch_refuses_active_lease_using_branch(self) -> None:
+        service, manager, tmp = self.make_service()
+        repo, _, source, deployed = self.make_cleanup_repo(tmp)
+        manager.acquire("agent-hq-dev", "679", "cinder", branch="task-679", commit=source)
+
+        payload = service.call_tool("dev_env_cleanup_task_branch", {
+            "repo_path": str(repo),
+            "source_branch": "task-679",
+            "source_commit": source,
+            "deployed_commit": deployed,
+            "actor": "release-agent",
+        })
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "unsafe_branch_cleanup_refused")
+        self.assertIn("active_lease_using_branch", {error["error"] for error in payload["errors"]})
+
+    def test_cleanup_task_branch_refuses_worktree_using_branch(self) -> None:
+        service, _, tmp = self.make_service()
+        repo, _, source, deployed = self.make_cleanup_repo(tmp)
+        linked_worktree = Path(tmp.name) / "task-679-worktree"
+        self.git(repo, "worktree", "add", str(linked_worktree), "task-679")
+
+        payload = service.call_tool("dev_env_cleanup_task_branch", {
+            "repo_path": str(repo),
+            "source_branch": "task-679",
+            "source_commit": source,
+            "deployed_commit": deployed,
+            "actor": "release-agent",
+        })
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "unsafe_branch_cleanup_refused")
+        self.assertIn("worktree_using_branch", {error["error"] for error in payload["errors"]})
 
 
 if __name__ == "__main__":

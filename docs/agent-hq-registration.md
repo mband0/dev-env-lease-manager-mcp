@@ -26,5 +26,7 @@ touch or inspect shared Agent HQ development environments.
 Implementation agents need `dev_env_deploy_worktree`. QA agents need
 `dev_env_validate_qa` and `dev_env_mark_qa_failed`. Release agents need
 `dev_env_mark_prod_deploying`, `dev_env_mark_prod_failed`, and
-`dev_env_mark_done`. Operators need `dev_env_status`, `dev_env_sweep_stale`, and
+`dev_env_mark_done`; after successful live verification they also need
+`dev_env_cleanup_task_branch` for dry-run and real task branch cleanup evidence.
+Operators need `dev_env_status`, `dev_env_sweep_stale`, and
 `dev_env_force_release`.

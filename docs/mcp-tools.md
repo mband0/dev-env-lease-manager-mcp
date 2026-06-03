@@ -35,6 +35,7 @@ released leases and removed lock entries.
 - `dev_env_validate_qa`
 - `dev_env_events`
 - `dev_env_callback_attempts`
+- `dev_env_cleanup_task_branch`
 - `dev_env_deploy_worktree`
 
 `dev_env_deploy_worktree` is the normal dev promotion tool. For environments
@@ -92,6 +93,46 @@ Each callback attempt is stored durably without the API key. Use
 `dev_env_callback_attempts` with `queue_id`, `lease_id`, `task_id`, or
 `environment_id` to inspect the attempted endpoint, auth presence, HTTP status,
 response body, error, and payload.
+
+## Branch Cleanup
+
+`dev_env_cleanup_task_branch` safely removes released task branches after
+production deploy/live verification has already proven the task commit is
+retained in deployed history. It is a cleanup tool, not a deploy tool; cleanup
+failure must be reported as cleanup failure and must not be treated as a failed
+production deploy.
+
+Required inputs:
+
+```json
+{
+  "repo_path": "/path/to/repo",
+  "source_branch": "task-679",
+  "source_commit": "abc123...",
+  "deployed_commit": "def456...",
+  "actor": "release-agent",
+  "remote": "origin",
+  "dry_run": true
+}
+```
+
+Safety checks:
+
+- refuses protected branch refs such as `main`, `master`, `origin/main`, and
+  `origin/master`
+- requires source branch, source commit, deployed commit, actor, and repo path
+- requires the source commit to be an ancestor of the deployed/main commit
+- requires local and remote branch tips to match the source commit or be proven
+  retained in deployed history
+- refuses deletion while any active lease or git worktree is using the branch
+- re-checks the remote branch tip immediately before `git push origin --delete`
+- uses `git branch -d` for local deletion and never force-deletes by default
+
+`dry_run` defaults to `true` and returns `checks`, `planned_actions`,
+`local`, `remote_status`, and any `errors` without deleting anything. Real mode
+uses `dry_run = false` and returns `performed_actions` with git command results.
+Already-missing branches are idempotent success only after the source commit is
+proven retained by the deployed commit.
 
 ## Example Acquire
 

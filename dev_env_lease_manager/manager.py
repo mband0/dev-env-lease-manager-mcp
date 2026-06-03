@@ -36,6 +36,16 @@ from .models import (
 CALLBACK_SOURCE = "dev_environment_lease_manager"
 QA_FIXTURE_TASK_ID_PREFIX = "999"
 QA_FIXTURE_TASK_ID_LENGTH = 6
+PROTECTED_BRANCH_REFS = {
+    "main",
+    "master",
+    "origin/main",
+    "origin/master",
+    "refs/heads/main",
+    "refs/heads/master",
+    "refs/remotes/origin/main",
+    "refs/remotes/origin/master",
+}
 
 
 def utc_now() -> str:
@@ -237,6 +247,385 @@ class LeaseManager:
             "lease_id": lease.get("id"),
             "status": lease.get("status"),
         }
+
+    def _git(self, repo_path: str, *args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", repo_path, *args],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+
+    def _git_payload(self, completed: subprocess.CompletedProcess[str]) -> Dict[str, Any]:
+        return {
+            "returncode": completed.returncode,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+
+    def _add_cleanup_check(self, checks: list[Dict[str, Any]], name: str, ok: bool,
+                           detail: Optional[Dict[str, Any]] = None) -> None:
+        check: Dict[str, Any] = {"name": name, "ok": bool(ok)}
+        if detail is not None:
+            check["detail"] = detail
+        checks.append(check)
+
+    def _normalize_cleanup_branch(self, source_branch: str, remote: str) -> tuple[str, str]:
+        raw_branch = str(source_branch or "").strip()
+        branch = raw_branch
+        if branch.startswith("refs/heads/"):
+            branch = branch[len("refs/heads/"):]
+        remote_prefix = f"{remote}/"
+        remote_ref_prefix = f"refs/remotes/{remote}/"
+        if branch.startswith(remote_ref_prefix):
+            branch = branch[len(remote_ref_prefix):]
+        elif branch.startswith(remote_prefix):
+            branch = branch[len(remote_prefix):]
+        return raw_branch, branch
+
+    def _branch_is_protected(self, raw_branch: str, normalized_branch: str, remote: str) -> bool:
+        candidates = {
+            raw_branch,
+            normalized_branch,
+            f"{remote}/{normalized_branch}",
+            f"refs/heads/{normalized_branch}",
+            f"refs/remotes/{remote}/{normalized_branch}",
+        }
+        return any(candidate in PROTECTED_BRANCH_REFS for candidate in candidates)
+
+    def _resolve_commit_for_cleanup(self, repo_path: str, rev: str) -> Dict[str, Any]:
+        completed = self._git(repo_path, "rev-parse", "--verify", f"{rev}^{{commit}}")
+        payload = self._git_payload(completed)
+        payload["ok"] = completed.returncode == 0 and bool(payload["stdout"])
+        if payload["ok"]:
+            payload["commit"] = payload["stdout"].splitlines()[-1].strip()
+        return payload
+
+    def _commit_is_ancestor(self, repo_path: str, ancestor: str, descendant: str) -> Dict[str, Any]:
+        completed = self._git(repo_path, "merge-base", "--is-ancestor", ancestor, descendant)
+        payload = self._git_payload(completed)
+        payload["ok"] = completed.returncode == 0
+        return payload
+
+    def _local_branch_status(self, repo_path: str, branch: str) -> Dict[str, Any]:
+        ref = f"refs/heads/{branch}"
+        completed = self._git(repo_path, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+        payload = self._git_payload(completed)
+        if completed.returncode == 0:
+            tip = payload["stdout"].splitlines()[-1] if payload["stdout"] else None
+            return {"exists": True, "ref": ref, "tip": tip, "git": payload}
+        if completed.returncode == 1:
+            return {"exists": False, "ref": ref, "tip": None, "git": payload}
+        return {"exists": None, "ref": ref, "tip": None, "git": payload, "error": "local_branch_lookup_failed"}
+
+    def _remote_branch_status(self, repo_path: str, remote: str, branch: str) -> Dict[str, Any]:
+        completed = self._git(repo_path, "ls-remote", "--heads", remote, branch, timeout=120)
+        payload = self._git_payload(completed)
+        if completed.returncode != 0:
+            return {"exists": None, "remote": remote, "branch": branch, "tip": None, "git": payload, "error": "remote_branch_lookup_failed"}
+        if not payload["stdout"]:
+            return {"exists": False, "remote": remote, "branch": branch, "tip": None, "git": payload}
+        first_line = payload["stdout"].splitlines()[0]
+        tip = first_line.split()[0] if first_line.split() else None
+        return {"exists": True, "remote": remote, "branch": branch, "tip": tip, "git": payload}
+
+    def _active_leases_using_branch(self, raw_branch: str, normalized_branch: str, remote: str) -> list[Dict[str, Any]]:
+        branch_variants = {
+            raw_branch,
+            normalized_branch,
+            f"{remote}/{normalized_branch}",
+            f"refs/heads/{normalized_branch}",
+            f"refs/remotes/{remote}/{normalized_branch}",
+        }
+        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM leases
+            WHERE released_at IS NULL
+              AND status IN ({placeholders})
+            ORDER BY acquired_at DESC
+            """,
+            tuple(sorted(ACTIVE_STATUSES)),
+        ).fetchall()
+        active: list[Dict[str, Any]] = []
+        for row in rows:
+            lease = row_to_dict(row)
+            if lease and str(lease.get("branch") or "") in branch_variants:
+                active.append(lease)
+        return active
+
+    def _worktrees_using_branch(self, repo_path: str, branch: str) -> Dict[str, Any]:
+        completed = self._git(repo_path, "worktree", "list", "--porcelain")
+        payload = self._git_payload(completed)
+        if completed.returncode != 0:
+            return {"ok": False, "git": payload, "worktrees": []}
+
+        worktrees: list[Dict[str, Any]] = []
+        current: Dict[str, Any] = {}
+        for line in completed.stdout.splitlines():
+            if not line.strip():
+                if current:
+                    worktrees.append(current)
+                    current = {}
+                continue
+            key, _, value = line.partition(" ")
+            if key == "worktree" and current:
+                worktrees.append(current)
+                current = {}
+            current[key] = value
+        if current:
+            worktrees.append(current)
+
+        branch_ref = f"refs/heads/{branch}"
+        using_branch = [
+            item for item in worktrees
+            if item.get("branch") in {branch_ref, branch}
+        ]
+        return {"ok": True, "git": payload, "worktrees": using_branch}
+
+    def _branch_tip_retained_check(self, repo_path: str, tip: Optional[str], source_commit: str,
+                                   deployed_commit: str) -> Dict[str, Any]:
+        if not tip:
+            return {"ok": False, "reason": "branch_tip_missing"}
+        if tip == source_commit:
+            return {"ok": True, "reason": "tip_matches_source_commit"}
+        ancestor = self._commit_is_ancestor(repo_path, tip, deployed_commit)
+        if ancestor.get("ok"):
+            return {"ok": True, "reason": "tip_is_ancestor_of_deployed_commit", "tip": tip}
+        return {
+            "ok": False,
+            "reason": "branch_tip_not_retained_in_deployed_history",
+            "tip": tip,
+            "git": ancestor,
+        }
+
+    def _remote_tip_retained_check(self, repo_path: str, remote: str, branch: str, tip: Optional[str],
+                                   source_commit: str, deployed_commit: str) -> Dict[str, Any]:
+        if not tip:
+            return {"ok": False, "reason": "remote_branch_tip_missing"}
+        if tip == source_commit:
+            return {"ok": True, "reason": "remote_tip_matches_source_commit"}
+
+        fetch = self._git(repo_path, "fetch", "--no-tags", remote, f"refs/heads/{branch}", timeout=120)
+        if fetch.returncode != 0:
+            return {
+                "ok": False,
+                "reason": "remote_tip_not_proven_retained",
+                "tip": tip,
+                "fetch": self._git_payload(fetch),
+            }
+        ancestor = self._commit_is_ancestor(repo_path, tip, deployed_commit)
+        if ancestor.get("ok"):
+            return {"ok": True, "reason": "remote_tip_is_ancestor_of_deployed_commit", "tip": tip}
+        return {
+            "ok": False,
+            "reason": "remote_branch_tip_not_retained_in_deployed_history",
+            "tip": tip,
+            "git": ancestor,
+        }
+
+    def cleanup_task_branch(self, repo_path: str, source_branch: str, source_commit: str,
+                            deployed_commit: str, actor: str, remote: str = "origin",
+                            dry_run: bool = True, delete_local: bool = True,
+                            delete_remote: bool = True) -> Dict[str, Any]:
+        checks: list[Dict[str, Any]] = []
+        planned_actions: list[Dict[str, Any]] = []
+        performed_actions: list[Dict[str, Any]] = []
+        errors: list[Dict[str, Any]] = []
+
+        raw_branch, branch = self._normalize_cleanup_branch(source_branch, remote or "origin")
+        result: Dict[str, Any] = {
+            "ok": False,
+            "status": "checking",
+            "dry_run": bool(dry_run),
+            "repo_path": repo_path,
+            "remote": remote or "origin",
+            "source_branch": raw_branch,
+            "normalized_branch": branch,
+            "source_commit": source_commit,
+            "deployed_commit": deployed_commit,
+            "checks": checks,
+            "planned_actions": planned_actions,
+            "performed_actions": performed_actions,
+            "errors": errors,
+        }
+
+        required = {
+            "repo_path": repo_path,
+            "source_branch": raw_branch,
+            "source_commit": source_commit,
+            "deployed_commit": deployed_commit,
+            "actor": actor,
+        }
+        for name, value in required.items():
+            ok = bool(str(value or "").strip())
+            self._add_cleanup_check(checks, f"{name}_provided", ok)
+            if not ok:
+                errors.append({"check": f"{name}_provided", "error": "missing_required_argument", "argument": name})
+        if errors:
+            result.update({"status": "refused", "error": "unsafe_branch_cleanup_refused"})
+            return result
+
+        repo = os.path.abspath(os.path.expanduser(os.path.expandvars(str(repo_path))))
+        result["repo_path"] = repo
+        repo_exists = os.path.isdir(repo)
+        self._add_cleanup_check(checks, "repo_path_exists", repo_exists, {"repo_path": repo})
+        if not repo_exists:
+            errors.append({"check": "repo_path_exists", "error": "repo_path_not_found", "repo_path": repo})
+            result.update({"status": "refused", "error": "unsafe_branch_cleanup_refused"})
+            return result
+
+        git_repo = self._git(repo, "rev-parse", "--is-inside-work-tree")
+        git_repo_ok = git_repo.returncode == 0 and git_repo.stdout.strip() == "true"
+        self._add_cleanup_check(checks, "repo_is_git_worktree", git_repo_ok, self._git_payload(git_repo))
+        if not git_repo_ok:
+            errors.append({"check": "repo_is_git_worktree", "error": "repo_is_not_git_worktree", "git": self._git_payload(git_repo)})
+
+        valid_branch = bool(branch) and self._git(repo, "check-ref-format", "--branch", branch).returncode == 0
+        self._add_cleanup_check(checks, "source_branch_name_valid", valid_branch, {"branch": branch})
+        if not valid_branch:
+            errors.append({"check": "source_branch_name_valid", "error": "invalid_source_branch", "branch": branch})
+
+        protected = self._branch_is_protected(raw_branch, branch, remote or "origin")
+        self._add_cleanup_check(checks, "source_branch_not_protected", not protected, {"branch": raw_branch, "normalized_branch": branch})
+        if protected:
+            errors.append({"check": "source_branch_not_protected", "error": "protected_branch_refused", "branch": raw_branch})
+
+        if errors:
+            result.update({"status": "refused", "error": "unsafe_branch_cleanup_refused"})
+            return result
+
+        source = self._resolve_commit_for_cleanup(repo, str(source_commit).strip())
+        self._add_cleanup_check(checks, "source_commit_resolves", bool(source.get("ok")), source)
+        if not source.get("ok"):
+            errors.append({"check": "source_commit_resolves", "error": "source_commit_not_found", "git": source})
+
+        deployed = self._resolve_commit_for_cleanup(repo, str(deployed_commit).strip())
+        self._add_cleanup_check(checks, "deployed_commit_resolves", bool(deployed.get("ok")), deployed)
+        if not deployed.get("ok"):
+            errors.append({"check": "deployed_commit_resolves", "error": "deployed_commit_not_found", "git": deployed})
+
+        if errors:
+            result.update({"status": "refused", "error": "unsafe_branch_cleanup_refused"})
+            return result
+
+        source_sha = str(source["commit"])
+        deployed_sha = str(deployed["commit"])
+        result["source_commit_resolved"] = source_sha
+        result["deployed_commit_resolved"] = deployed_sha
+
+        retained = self._commit_is_ancestor(repo, source_sha, deployed_sha)
+        self._add_cleanup_check(checks, "source_commit_retained_in_deployed_history", bool(retained.get("ok")), retained)
+        if not retained.get("ok"):
+            errors.append({
+                "check": "source_commit_retained_in_deployed_history",
+                "error": "source_commit_not_retained_in_deployed_history",
+                "git": retained,
+            })
+
+        active_leases = self._active_leases_using_branch(raw_branch, branch, remote or "origin")
+        result["active_leases_using_branch"] = active_leases
+        self._add_cleanup_check(checks, "no_active_lease_using_branch", not active_leases, {"active_leases": active_leases})
+        if active_leases:
+            errors.append({"check": "no_active_lease_using_branch", "error": "active_lease_using_branch", "active_leases": active_leases})
+
+        worktrees = self._worktrees_using_branch(repo, branch)
+        result["worktrees_using_branch"] = worktrees.get("worktrees", [])
+        self._add_cleanup_check(checks, "worktree_list_available", bool(worktrees.get("ok")), worktrees.get("git"))
+        if not worktrees.get("ok"):
+            errors.append({"check": "worktree_list_available", "error": "worktree_list_failed", "git": worktrees.get("git")})
+        self._add_cleanup_check(checks, "no_worktree_using_branch", not worktrees.get("worktrees"), {"worktrees": worktrees.get("worktrees", [])})
+        if worktrees.get("worktrees"):
+            errors.append({"check": "no_worktree_using_branch", "error": "worktree_using_branch", "worktrees": worktrees["worktrees"]})
+
+        local = self._local_branch_status(repo, branch)
+        result["local"] = local
+        self._add_cleanup_check(checks, "local_branch_lookup", local.get("exists") is not None, local.get("git"))
+        if local.get("exists") is None:
+            errors.append({"check": "local_branch_lookup", "error": "local_branch_lookup_failed", "git": local.get("git")})
+        elif local.get("exists"):
+            local_retained = self._branch_tip_retained_check(repo, local.get("tip"), source_sha, deployed_sha)
+            local["retained_check"] = local_retained
+            self._add_cleanup_check(checks, "local_branch_tip_safe", bool(local_retained.get("ok")), local_retained)
+            if not local_retained.get("ok"):
+                errors.append({"check": "local_branch_tip_safe", "error": "local_branch_tip_not_safe", "detail": local_retained})
+
+        remote_status = self._remote_branch_status(repo, remote or "origin", branch)
+        result["remote_status"] = remote_status
+        self._add_cleanup_check(checks, "remote_branch_lookup", remote_status.get("exists") is not None, remote_status.get("git"))
+        if remote_status.get("exists") is None:
+            errors.append({"check": "remote_branch_lookup", "error": "remote_branch_lookup_failed", "git": remote_status.get("git")})
+        elif remote_status.get("exists"):
+            remote_retained = self._remote_tip_retained_check(repo, remote or "origin", branch, remote_status.get("tip"), source_sha, deployed_sha)
+            remote_status["retained_check"] = remote_retained
+            self._add_cleanup_check(checks, "remote_branch_tip_safe", bool(remote_retained.get("ok")), remote_retained)
+            if not remote_retained.get("ok"):
+                errors.append({"check": "remote_branch_tip_safe", "error": "remote_branch_tip_not_safe", "detail": remote_retained})
+
+        if errors:
+            result.update({"status": "refused", "error": "unsafe_branch_cleanup_refused"})
+            return result
+
+        if delete_local:
+            if local.get("exists"):
+                planned_actions.append({"target": "local", "action": "delete_branch", "command": ["git", "branch", "-d", branch]})
+                local["planned_action"] = "delete_branch"
+            else:
+                local["planned_action"] = "already_missing"
+        else:
+            local["planned_action"] = "skip"
+
+        if delete_remote:
+            if remote_status.get("exists"):
+                planned_actions.append({"target": "remote", "action": "delete_branch", "command": ["git", "push", remote or "origin", "--delete", branch]})
+                remote_status["planned_action"] = "delete_branch"
+            else:
+                remote_status["planned_action"] = "already_missing"
+        else:
+            remote_status["planned_action"] = "skip"
+
+        if dry_run:
+            result.update({"ok": True, "status": "dry_run"})
+            return result
+
+        if delete_remote and remote_status.get("exists"):
+            recheck = self._remote_branch_status(repo, remote or "origin", branch)
+            remote_status["pre_delete_recheck"] = recheck
+            recheck_ok = recheck.get("exists") is False
+            if recheck.get("exists"):
+                recheck_retained = self._remote_tip_retained_check(repo, remote or "origin", branch, recheck.get("tip"), source_sha, deployed_sha)
+                recheck["retained_check"] = recheck_retained
+                recheck_ok = bool(recheck_retained.get("ok"))
+            if not recheck_ok:
+                result.update({
+                    "status": "refused",
+                    "error": "unsafe_branch_cleanup_refused",
+                })
+                errors.append({"check": "remote_branch_pre_delete_recheck", "error": "remote_branch_tip_drift", "remote": recheck})
+                return result
+            if recheck.get("exists"):
+                push = self._git(repo, "push", remote or "origin", "--delete", branch, timeout=120)
+                action = {"target": "remote", "action": "delete_branch", "git": self._git_payload(push)}
+                performed_actions.append(action)
+                if push.returncode != 0:
+                    errors.append({"check": "remote_delete", "error": "cleanup_failed", "action": action})
+
+        if delete_local and local.get("exists"):
+            delete = self._git(repo, "branch", "-d", branch)
+            action = {"target": "local", "action": "delete_branch", "git": self._git_payload(delete)}
+            performed_actions.append(action)
+            if delete.returncode != 0:
+                errors.append({"check": "local_delete", "error": "cleanup_failed", "action": action})
+
+        if errors:
+            result.update({"status": "cleanup_failed", "error": "cleanup_failed"})
+            return result
+
+        result.update({"ok": True, "status": "cleaned"})
+        return result
 
     def _queue_view(self, queue: Dict[str, Any], active_lease: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         public = self._public_queue(queue)
