@@ -410,7 +410,7 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertEqual(by_env["agent-hq-dev-2"]["active_lease"]["task_id"], "426")
         self.assertEqual(by_env["agent-hq-dev-2"]["active_lease"]["commit_sha"], "deploy-commit")
 
-    def test_sweep_deploy_queue_assigns_queued_request_to_matching_available_environment(self) -> None:
+    def test_sweep_deploy_queue_dry_run_previews_matching_available_environment_without_mutation(self) -> None:
         manager, tmp = self.make_manager(
             environment_tags=["agent-hq", "dev", "shared-checkout"],
             extra_environments=[{
@@ -435,6 +435,7 @@ class LeaseManagerTests(ManagerTestCase):
             dry_run=True,
             queue_if_busy=True,
         )["queue"]
+        callback_count_before = manager.conn.execute("SELECT COUNT(*) FROM callback_attempts").fetchone()[0]
         manager.force_release("operator", "free alternate", lease_id=active_dev_2["id"], sweep_queue_after_release=False)
 
         result = manager.sweep_deploy_queue("queue-worker", environment_id="agent-hq-dev-2", dry_run=True)
@@ -444,11 +445,16 @@ class LeaseManagerTests(ManagerTestCase):
         processed = result["processed"][0]
         self.assertEqual(processed["queue"]["id"], queued["id"])
         self.assertEqual(processed["queue"]["requested_environment_id"], "agent-hq-dev")
-        self.assertEqual(processed["queue"]["assigned_environment_id"], "agent-hq-dev-2")
-        self.assertEqual(processed["queue"]["environment_id"], "agent-hq-dev-2")
+        self.assertIsNone(processed["queue"]["assigned_environment_id"])
+        self.assertEqual(processed["queue"]["environment_id"], "agent-hq-dev")
+        self.assertEqual(processed["queue"]["status"], "queued")
+        self.assertTrue(processed["result"]["dry_run"])
+        self.assertEqual(processed["result"]["status"], "would_deploy")
+        self.assertEqual(processed["callbacks"], [])
+        callback_count = manager.conn.execute("SELECT COUNT(*) FROM callback_attempts").fetchone()[0]
+        self.assertEqual(callback_count, callback_count_before)
         lease = manager.status("agent-hq-dev-2")["environments"][0]["active_lease"]
-        self.assertEqual(lease["task_id"], "427")
-        self.assertEqual(lease["commit_sha"], "queued-commit")
+        self.assertIsNone(lease)
 
     def test_queue_status_reports_current_busy_owner_from_active_lease(self) -> None:
         manager, tmp = self.make_manager()
@@ -535,7 +541,7 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertNotIn("busy_owner", entry["metadata"])
         self.assertEqual(entry["metadata"]["queued_because_owner"]["task_id"], active["task_id"])
 
-    def test_sweep_deploy_queue_deploys_exact_queued_commit_after_release(self) -> None:
+    def test_sweep_deploy_queue_dry_run_does_not_deploy_exact_queued_commit_after_release(self) -> None:
         manager, tmp = self.make_manager()
         source = Path(tmp.name) / "source"
         source.mkdir()
@@ -550,6 +556,7 @@ class LeaseManagerTests(ManagerTestCase):
             dry_run=True,
             queue_if_busy=True,
         )["queue"]
+        callback_count_before = manager.conn.execute("SELECT COUNT(*) FROM callback_attempts").fetchone()[0]
         manager.force_release("operator", "free queue", lease_id=active["id"], sweep_queue_after_release=False)
 
         result = manager.sweep_deploy_queue("queue-worker", dry_run=True)
@@ -558,11 +565,17 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertEqual(len(result["processed"]), 1)
         processed = result["processed"][0]
         self.assertEqual(processed["queue"]["id"], queued["id"])
-        self.assertEqual(processed["queue"]["status"], "deployed")
-        self.assertEqual(processed["result"]["status"], "deployed_for_qa")
+        self.assertEqual(processed["queue"]["status"], "queued")
+        self.assertTrue(processed["result"]["dry_run"])
+        self.assertEqual(processed["result"]["status"], "would_deploy")
+        self.assertEqual(processed["callbacks"], [])
         lease = manager.status()["environments"][0]["active_lease"]
-        self.assertEqual(lease["task_id"], "426")
-        self.assertEqual(lease["commit_sha"], "queued-commit")
+        self.assertIsNone(lease)
+        queue = manager.queue_status("agent-hq-dev")["queue"][0]
+        self.assertEqual(queue["id"], queued["id"])
+        self.assertEqual(queue["status"], "queued")
+        callback_count = manager.conn.execute("SELECT COUNT(*) FROM callback_attempts").fetchone()[0]
+        self.assertEqual(callback_count, callback_count_before)
 
     def test_sweep_deploy_queue_fails_preexisting_qa_fixture_queue(self) -> None:
         manager, tmp = self.make_manager()
@@ -580,7 +593,7 @@ class LeaseManagerTests(ManagerTestCase):
             ("fixture-queue", "agent-hq-dev", "999456", "cinder", str(source), now, now),
         )
 
-        result = manager.sweep_deploy_queue("queue-worker", dry_run=True)
+        result = manager.sweep_deploy_queue("queue-worker")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["processed"][0]["queue"]["status"], "failed")
@@ -686,7 +699,13 @@ class LeaseManagerTests(ManagerTestCase):
                 callback_api_key="test-key",
             )["queue"]
             manager.force_release("operator", "free queue", lease_id=active["id"], sweep_queue_after_release=False)
-            manager.sweep_deploy_queue("queue-worker", dry_run=True)
+            with patch("dev_env_lease_manager.manager.NativeDevDeployer") as deployer_class:
+                deployer_class.return_value.deploy.return_value = {
+                    "ok": True,
+                    "mode": "native",
+                    "source_sha": "queued-commit",
+                }
+                manager.sweep_deploy_queue("queue-worker")
 
         self.assertEqual([event["event"] for event in captured_events], [
             "dev_deploy_queued",

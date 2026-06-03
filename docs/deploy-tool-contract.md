@@ -74,6 +74,26 @@ Callers may still run `sweep-deploy-queue` manually for recovery or operator
 maintenance, but the expected path is that releasing the active lease promotes
 the next queued request automatically.
 
+Production installations should also run the long-lived deploy worker:
+
+```sh
+pm2 start ecosystem.config.js --only dev-env-deploy-worker
+pm2 save
+```
+
+The worker polls the queue, reconciles orphaned deploy rows, and claims queued
+deploys when a matching environment is available. Verify it with:
+
+```sh
+pm2 status dev-env-deploy-worker
+pm2 logs dev-env-deploy-worker --lines 50
+.venv/bin/dev-env-lease --config config/environments.json queue-status --environment-id agent-hq-dev
+```
+
+`sweep-deploy-queue --dry-run` and MCP `dev_env_sweep_deploy_queue` with
+`dry_run: true` are read-only previews. They do not acquire leases, mutate queue
+rows, execute deploys, or send callbacks.
+
 Queued callbacks use the explicit `callback_url` / `callback_api_key` when
 provided. If omitted, the manager falls back to `agent_hq.base_url` for the
 callback URL. The callback API key must come from the calling agent's

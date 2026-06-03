@@ -2550,6 +2550,28 @@ class LeaseManager:
                 continue
 
             task_rejection = qa_fixture_task_rejection(queue["task_id"]) if is_qa_fixture_task_id(queue["task_id"]) else None
+            if dry_run:
+                result: Dict[str, Any] = {
+                    "ok": task_rejection is None,
+                    "dry_run": True,
+                    "status": "would_deploy",
+                    "environment_id": str(env_id),
+                    "message": f"Queued deploy {queue['id']} would be claimed for {env_id}.",
+                }
+                if task_rejection:
+                    result.update({
+                        "status": "would_fail",
+                        "error": "qa_fixture_task_not_deployable",
+                        "rejection": task_rejection,
+                        "message": f"Queued deploy {queue['id']} would be rejected: {task_rejection['message']}",
+                    })
+                processed.append({
+                    "queue": self._public_queue(queue),
+                    "result": result,
+                    "callbacks": [],
+                })
+                continue
+
             if task_rejection:
                 error = self._callback_error("reject_qa_fixture_task", task_rejection)
                 failed_queue = self._set_queue_status(queue["id"], "failed", error=error)

@@ -21,6 +21,36 @@ python3.11 -m venv .venv
 .venv/bin/dev-env-lease-mcp --config config/environments.json
 ```
 
+## Deploy Queue Worker
+
+The lease-aware deploy path queues requests when all matching dev environments
+are busy. A long-running worker must be online to drain those queued requests
+when an environment later becomes available. Normal lease release also sweeps
+one queued request for the released environment, but release-time sweeping is not
+a substitute for the worker because queued rows can remain after interrupted
+deploys, service restarts, or manual repairs.
+
+Run the worker under PM2 from this repo:
+
+```sh
+pm2 start ecosystem.config.js --only dev-env-deploy-worker
+pm2 save
+```
+
+Restart or inspect it with:
+
+```sh
+pm2 restart dev-env-deploy-worker
+pm2 status dev-env-deploy-worker
+pm2 logs dev-env-deploy-worker --lines 50
+.venv/bin/dev-env-lease --config config/environments.json queue-status --environment-id agent-hq-dev
+```
+
+The worker executes `python -m dev_env_lease_manager.worker` with
+`config/environments.json`, reconciles orphaned deploy rows each tick, then
+claims at most one queued deploy. The default poll interval is 5 seconds and can
+be overridden with `DEV_ENV_DEPLOY_WORKER_POLL_INTERVAL`.
+
 ## Operator CLI
 
 ```sh
@@ -32,9 +62,14 @@ python3.11 -m venv .venv
 .venv/bin/dev-env-lease force-release --environment-id agent-hq-dev --actor operator:admin --reason stale
 .venv/bin/dev-env-lease queue-status --environment-id agent-hq-dev
 .venv/bin/dev-env-lease sweep-deploy-queue --environment-id agent-hq-dev --actor queue-worker
+.venv/bin/dev-env-lease sweep-deploy-queue --environment-id agent-hq-dev --actor operator:preview --dry-run
 .venv/bin/dev-env-lease sweep-deploy-locks --environment-id agent-hq-dev --actor operator:admin --reason stale-native-lock
 .venv/bin/dev-env-lease callback-attempts --task-id 448
 ```
+
+`sweep-deploy-queue --dry-run` is preview-only: it reports the queued row that
+would be claimed and does not acquire leases, change queue status, run deploys,
+or send callbacks.
 
 Native deploys use an OS-level `deploy.lock` file in each environment state
 directory. `status` reports live or stale native deploy locks, and
