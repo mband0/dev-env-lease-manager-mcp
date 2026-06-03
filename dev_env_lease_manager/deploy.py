@@ -716,7 +716,17 @@ class NativeDevDeployer:
         timeout_seconds: int = 1800,
         database_policy: str = "preflight_and_apply",
         lock_metadata: Optional[Dict[str, Any]] = None,
+        on_phase: Optional[Callable[[str, Optional[Dict[str, Any]]], None]] = None,
     ) -> Dict[str, Any]:
+        def report_phase(phase: str, detail: Optional[Dict[str, Any]] = None) -> None:
+            if on_phase is None:
+                return
+            try:
+                on_phase(phase, detail)
+            except Exception:
+                # Progress reporting must never abort a deploy.
+                pass
+
         metadata = env.get("metadata") or {}
         dev_repo_path = env.get("repo_path")
         if not dev_repo_path:
@@ -777,6 +787,7 @@ class NativeDevDeployer:
                 raise NativeDeployError("dev_repo_path is not a directory")
             self._git(dev_repo_path, "rev-parse", "--show-toplevel")
             dev_predeploy_cleanup = self._prepare_dev_checkout(dev_repo_path, timeout_seconds)
+            report_phase("checkout_prepared", {"source_sha": source_sha})
 
             for relative_path in ("agent-hq-dev.db", ".env", ".env.local", "api/.env", "api/.env.local", "ui/.env", "ui/.env.local"):
                 self._copy_if_missing(canonical_root, dev_repo_path, relative_path)
@@ -799,11 +810,13 @@ class NativeDevDeployer:
             shutil.rmtree(Path(dev_repo_path) / "api/dist", ignore_errors=True)
             shutil.rmtree(Path(dev_repo_path) / "ui/.next", ignore_errors=True)
 
+            report_phase("checkout_reset", {"source_sha": source_sha})
             dependency_setup: Dict[str, Any] = {}
             if "api" in service_list:
                 api_dir = str(Path(dev_repo_path) / "api")
                 dependency_setup["api"] = self._ensure_deps(api_dir, timeout_seconds)
                 self._run(["npm", "run", "build"], cwd=api_dir, timeout=timeout_seconds)
+                report_phase("api_built")
                 migration_setup = self._run_database_migrations(
                     api_dir,
                     dev_db_path,
@@ -813,6 +826,7 @@ class NativeDevDeployer:
                     database_policy,
                     timeout_seconds,
                 )
+                report_phase("database_migrated")
                 self._run(["pm2", "delete", api_name], timeout=60, check=False)
                 api_env = os.environ.copy()
                 api_env.update({
@@ -826,11 +840,13 @@ class NativeDevDeployer:
                     "NODE_TLS_REJECT_UNAUTHORIZED": os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED", "0"),
                 })
                 self._run(["pm2", "start", "npm", "--name", api_name, "--cwd", api_dir, "--", "start"], env=api_env, timeout=timeout_seconds)
+                report_phase("api_restarted")
 
             if "ui" in service_list:
                 ui_dir = str(Path(dev_repo_path) / "ui")
                 dependency_setup["ui"] = self._ensure_deps(ui_dir, timeout_seconds)
                 self._run(["npm", "run", "build"], cwd=ui_dir, timeout=timeout_seconds)
+                report_phase("ui_built")
                 self._run(["pm2", "delete", ui_name], timeout=60, check=False)
                 ui_env = os.environ.copy()
                 ui_env.update({
@@ -839,7 +855,9 @@ class NativeDevDeployer:
                     "NEXT_PUBLIC_API_URL": f"http://localhost:{api_port}",
                 })
                 self._run(["pm2", "start", "npm", "--name", ui_name, "--cwd", ui_dir, "--", "run", "start-dev"], env=ui_env, timeout=timeout_seconds)
+                report_phase("ui_restarted")
 
+            report_phase("health_check")
             health = self._health_check(service_list, api_port, ui_port) if health_check else {}
             state = {
                 "previous": {

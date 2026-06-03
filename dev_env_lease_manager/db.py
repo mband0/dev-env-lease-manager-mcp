@@ -14,7 +14,9 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
     init_schema(conn)
+    migrate_schema(conn)
     return conn
 
 
@@ -130,6 +132,32 @@ def init_schema(conn: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_callback_attempts_task
       ON callback_attempts(environment_id, task_id, id);
     """)
+
+
+# Columns added to deploy_queue after the original schema shipped. Each entry is a
+# bare `ALTER TABLE deploy_queue ADD COLUMN` fragment applied only when the column
+# is missing, so existing state databases upgrade in place without data loss.
+DEPLOY_QUEUE_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("heartbeat_at", "heartbeat_at TEXT"),
+    ("phase", "phase TEXT"),
+    ("worker_pid", "worker_pid INTEGER"),
+    ("worker_id", "worker_id TEXT"),
+    ("attempts", "attempts INTEGER NOT NULL DEFAULT 0"),
+    ("claimed_at", "claimed_at TEXT"),
+)
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(deploy_queue)").fetchall()}
+    for column, definition in DEPLOY_QUEUE_MIGRATIONS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE deploy_queue ADD COLUMN {definition}")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_deploy_queue_status_heartbeat
+          ON deploy_queue(status, heartbeat_at)
+        """
+    )
 
 
 def sync_environments(conn: sqlite3.Connection, config: LeaseManagerConfig, now: str) -> None:

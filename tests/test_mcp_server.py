@@ -166,11 +166,30 @@ class McpServerTests(unittest.TestCase):
                 "task_id": "426",
                 "actor": "cinder",
                 "source_repo_path": str(source),
+                "synchronous": True,
             })
 
         self.assertTrue(payload["ok"])
         self.assertEqual(deploy.call_args.kwargs["timeout_seconds"], DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS)
         self.assertEqual(deploy.call_args.kwargs["database_policy"], "preflight_and_apply")
+
+    def test_deploy_tool_defaults_to_async_background_worker(self) -> None:
+        service, manager, tmp = self.make_service()
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+
+        with patch.object(manager, "lease_aware_deploy") as inline_deploy:
+            payload = service.call_tool("dev_env_deploy_worktree", {
+                "environment_id": "agent-hq-dev",
+                "task_id": "426",
+                "actor": "cinder",
+                "source_repo_path": str(source),
+            })
+
+        inline_deploy.assert_not_called()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "accepted")
+        self.assertTrue(payload["queue_id"])
 
     def test_failure_class_errors_become_specific_callback_events(self) -> None:
         service, manager, _ = self.make_service()

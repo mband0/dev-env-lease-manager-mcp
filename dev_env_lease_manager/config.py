@@ -27,12 +27,18 @@ class EnvironmentConfig:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+DEFAULT_DEPLOY_ORPHAN_AFTER_SECONDS = 600
+DEFAULT_DEPLOY_WORKER_POLL_INTERVAL_SECONDS = 5
+
+
 @dataclass(frozen=True)
 class LeaseManagerConfig:
     data_path: str
     default_stale_after_seconds: int
     environments: List[EnvironmentConfig]
     agent_hq_base_url: Optional[str] = None
+    deploy_orphan_after_seconds: int = DEFAULT_DEPLOY_ORPHAN_AFTER_SECONDS
+    deploy_worker_poll_interval_seconds: int = DEFAULT_DEPLOY_WORKER_POLL_INTERVAL_SECONDS
 
 
 def _expand_path(value: str) -> str:
@@ -45,6 +51,13 @@ def load_config(path: str) -> LeaseManagerConfig:
     default_stale = int(raw.get("default_stale_after_seconds", DEFAULT_STALE_AFTER_SECONDS))
     data_path = _expand_path(raw.get("data_path", "~/.dev-environment-lease-manager/state.sqlite3"))
     agent_hq = raw.get("agent_hq") or {}
+
+    orphan_after = int(raw.get("deploy_orphan_after_seconds", DEFAULT_DEPLOY_ORPHAN_AFTER_SECONDS))
+    if orphan_after <= 0:
+        raise ValueError("deploy_orphan_after_seconds must be positive")
+    poll_interval = int(raw.get("deploy_worker_poll_interval_seconds", DEFAULT_DEPLOY_WORKER_POLL_INTERVAL_SECONDS))
+    if poll_interval <= 0:
+        raise ValueError("deploy_worker_poll_interval_seconds must be positive")
 
     environments: List[EnvironmentConfig] = []
     seen = set()
@@ -82,6 +95,8 @@ def load_config(path: str) -> LeaseManagerConfig:
         default_stale_after_seconds=default_stale,
         environments=environments,
         agent_hq_base_url=agent_hq.get("base_url"),
+        deploy_orphan_after_seconds=orphan_after,
+        deploy_worker_poll_interval_seconds=poll_interval,
     )
 
 

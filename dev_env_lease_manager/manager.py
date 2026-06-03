@@ -6,7 +6,8 @@ import os
 import shlex
 import sqlite3
 import subprocess
-from typing import Any, Dict, Iterable, Optional
+import time
+from typing import Any, Callable, Dict, Iterable, Optional
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,6 +22,7 @@ from .deploy import (
     commit_matches_expected,
     inspect_native_deploy_lock,
     normalize_database_policy,
+    process_alive,
     sweep_native_deploy_lock,
 )
 from .models import (
@@ -1230,6 +1232,8 @@ class LeaseManager:
             fields["environment_id"] = environment_id
         if status == "deploying":
             fields["started_at"] = now
+            fields["heartbeat_at"] = now
+            fields["claimed_at"] = now
         if status in QUEUE_TERMINAL_STATUSES:
             fields["completed_at"] = now
         if lease_id is not None:
@@ -1687,10 +1691,12 @@ class LeaseManager:
     def mcp_preflight_cleanup(self, actor: str = "mcp:auto-sweep") -> Dict[str, Any]:
         stale_leases = self.release_stale_leases(actor)
         deploy_locks = self.sweep_deploy_locks(actor, "mcp preflight stale deploy lock cleanup")
+        orphaned_deploys = self.reconcile_stuck_deploys(actor)
         return {
-            "ok": bool(stale_leases.get("ok")) and bool(deploy_locks.get("ok")),
+            "ok": bool(stale_leases.get("ok")) and bool(deploy_locks.get("ok")) and bool(orphaned_deploys.get("ok")),
             "stale_leases": stale_leases,
             "deploy_locks": deploy_locks,
+            "orphaned_deploys": orphaned_deploys,
         }
 
     def events(self, lease_id: str) -> Dict[str, Any]:
@@ -1772,7 +1778,9 @@ class LeaseManager:
                                task_id: str, actor: str, source_repo_path: str,
                                commit: Optional[str], services: str, health_check: bool,
                                dry_run: bool, timeout_seconds: int,
-                               database_policy: str = "preflight_and_apply") -> Dict[str, Any]:
+                               database_policy: str = "preflight_and_apply",
+                               on_phase: Optional[Callable[[str, Optional[Dict[str, Any]]], None]] = None,
+                               ) -> Dict[str, Any]:
         if dry_run:
             deployed = self.transition(lease_id, "mark_deployed_for_qa", actor, {"dry_run": True, "served_commit": commit})
             deployed["deploy"] = {"dry_run": True}
@@ -1810,6 +1818,7 @@ class LeaseManager:
                         "branch": current_lease.get("branch"),
                         "commit": commit,
                     },
+                    on_phase=on_phase,
                 )
             except NativeDeployError as exc:
                 deploy_payload = exc.payload()
@@ -2032,6 +2041,110 @@ class LeaseManager:
             deployed["assigned_environment_id"] = target_environment_id
         return deployed
 
+    MAX_DEPLOY_WAIT_SECONDS = 600
+
+    def _wait_for_queue_terminal(self, queue_id: str, wait_seconds: int,
+                                 poll_interval: float = 0.5) -> Dict[str, Any]:
+        """Poll a queue row up to ``wait_seconds`` for a terminal status.
+
+        Only bounds how long the *tool call* waits — the deploy worker owns execution,
+        so a timeout here never orphans the deploy; the caller just doesn't see the
+        final result in this turn and learns it via the callback instead.
+        """
+        deadline = time.monotonic() + min(int(wait_seconds), self.MAX_DEPLOY_WAIT_SECONDS)
+        while True:
+            queue = self._queue_row(queue_id)
+            if not queue:
+                return {"settled": False, "reason": "queue_request_not_found"}
+            if queue["status"] in QUEUE_TERMINAL_STATUSES:
+                return {
+                    "settled": True,
+                    "status": queue["status"],
+                    "queue": self._public_queue(queue),
+                    "lease": self._lease(str(queue["lease_id"])) if queue.get("lease_id") else None,
+                }
+            if time.monotonic() >= deadline:
+                return {
+                    "settled": False,
+                    "reason": "still_deploying",
+                    "queue": self._public_queue(queue),
+                }
+            time.sleep(poll_interval)
+
+    def deploy_worktree_async(self, environment_id: str, task_id: str, actor: str, source_repo_path: str,
+                              agent_id: Optional[str] = None, agent_name: Optional[str] = None,
+                              branch: Optional[str] = None, commit: Optional[str] = None,
+                              services: str = "both", health_check: bool = True,
+                              priority: int = 0, callback_url: Optional[str] = None,
+                              callback_api_key: Optional[str] = None,
+                              database_policy: str = "preflight_and_apply",
+                              wait_seconds: int = 0) -> Dict[str, Any]:
+        """Enqueue a deploy for the background worker and return immediately.
+
+        The deploy executes in the pm2 deploy worker, not in this call, so it survives
+        the caller's tool boundary / session. Outcomes arrive via the Agent HQ callback
+        (``deployed_for_qa`` / ``deploy_failed``); pass ``wait_seconds`` to additionally
+        block this call for a bounded time and surface the terminal result inline.
+        """
+        task_rejection = qa_fixture_task_rejection(task_id) if is_qa_fixture_task_id(task_id) else None
+        if task_rejection:
+            return task_rejection
+        env = self._environment(environment_id)
+        if not env:
+            return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
+        if not os.path.isdir(source_repo_path):
+            return {"ok": False, "error": "source_repo_path_not_found", "source_repo_path": source_repo_path}
+        database_policy = normalize_database_policy(database_policy)
+
+        active_owner_check = self._validate_task_active_owner(str(task_id), callback_url, callback_api_key)
+        if not active_owner_check.get("ok"):
+            return active_owner_check
+        deploy_metadata: Dict[str, Any] = {"database_policy": database_policy}
+        authorization_metadata = self._active_owner_authorization_metadata(active_owner_check)
+        if authorization_metadata:
+            deploy_metadata["active_owner_authorization"] = authorization_metadata
+        active = self._active_lease(environment_id)
+        if active:
+            deploy_metadata["queued_because_owner"] = self._owner_from_lease(active)
+
+        enqueue = self.enqueue_deploy_request(
+            environment_id,
+            task_id,
+            actor,
+            source_repo_path,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            branch=branch,
+            commit=commit,
+            services=services,
+            health_check=health_check,
+            priority=priority,
+            callback_url=callback_url,
+            callback_api_key=callback_api_key,
+            metadata=deploy_metadata,
+            database_policy=database_policy,
+        )
+        if not enqueue.get("ok"):
+            return enqueue
+
+        queue = enqueue.get("queue") or {}
+        result: Dict[str, Any] = {
+            "ok": True,
+            "status": "accepted",
+            "mode": "async",
+            "environment": enqueue.get("environment"),
+            "queue_id": queue.get("id"),
+            "queue": queue,
+            "superseded": enqueue.get("superseded"),
+            "callbacks": enqueue.get("callbacks"),
+            "next_action": "Deploy runs in the background worker; watch for the deployed_for_qa/deploy_failed callback or poll dev_env_queue_status.",
+        }
+        if wait_seconds and int(wait_seconds) > 0 and queue.get("id"):
+            result["wait"] = self._wait_for_queue_terminal(str(queue["id"]), int(wait_seconds))
+            if result["wait"].get("settled"):
+                result["status"] = result["wait"].get("status")
+        return result
+
     def _next_queued_request(self, environment_id: str) -> Optional[Dict[str, Any]]:
         env = self._environment(environment_id)
         if not env:
@@ -2049,6 +2162,359 @@ class LeaseManager:
             if queue and self._queue_matches_environment(queue, env):
                 return queue
         return None
+
+    def _claim_queue_row(self, queue_id: str, env_id: str, worker_id: Optional[str],
+                         worker_pid: Optional[int]) -> Optional[Dict[str, Any]]:
+        """Atomically flip a still-queued row to ``deploying`` and stamp the owner.
+
+        Returns the claimed row, or ``None`` when another worker already claimed it.
+        The guarded UPDATE plus the per-environment unique active-lease index are
+        what serialize concurrent workers.
+        """
+        now = utc_now()
+        cursor = self.conn.execute(
+            """
+            UPDATE deploy_queue
+            SET status = 'deploying', environment_id = ?, started_at = ?, claimed_at = ?,
+                heartbeat_at = ?, updated_at = ?, phase = 'claimed',
+                worker_id = ?, worker_pid = ?, attempts = attempts + 1
+            WHERE id = ? AND status = 'queued'
+            """,
+            (str(env_id), now, now, now, now, worker_id, worker_pid, queue_id),
+        )
+        if cursor.rowcount != 1:
+            return None
+        return self._queue_row(queue_id)
+
+    def _release_queue_claim(self, queue_id: str) -> None:
+        """Return a claimed row to ``queued`` when the lease could not be acquired."""
+        self.conn.execute(
+            """
+            UPDATE deploy_queue
+            SET status = 'queued', worker_id = NULL, worker_pid = NULL,
+                claimed_at = NULL, started_at = NULL, heartbeat_at = NULL,
+                phase = NULL, updated_at = ?
+            WHERE id = ? AND status = 'deploying'
+            """,
+            (utc_now(), queue_id),
+        )
+
+    def _begin_queue_deploy(self, env: Dict[str, Any], queue: Dict[str, Any], actor: str,
+                            worker_id: Optional[str] = None,
+                            worker_pid: Optional[int] = None) -> Dict[str, Any]:
+        """Claim a queued row, acquire its lease, and mark it deploying.
+
+        Returns ``{"ok": True, "queue", "lease", "callbacks"}`` on success, or a
+        non-ok result carrying ``skipped`` / ``processed`` for the caller to record.
+        """
+        env_id = str(env["id"])
+        claimed = self._claim_queue_row(queue["id"], env_id, worker_id, worker_pid)
+        if claimed is None:
+            return {"ok": False, "skipped": {"environment_id": env_id, "queue": self._public_queue(queue), "reason": "already_claimed"}}
+
+        acquire = self.acquire(
+            env_id,
+            str(claimed["task_id"]),
+            actor,
+            claimed.get("agent_id"),
+            claimed.get("agent_name"),
+            claimed.get("branch"),
+            claimed.get("commit_sha"),
+            {
+                "source_repo_path": claimed.get("source_repo_path"),
+                "queue_id": claimed["id"],
+            },
+            supersede_same_task_review=True,
+        )
+        if not acquire.get("ok"):
+            self._release_queue_claim(claimed["id"])
+            reverted = self._queue_row(claimed["id"]) or claimed
+            return {"ok": False, "skipped": {"environment_id": env_id, "queue": self._public_queue(reverted), "reason": acquire.get("error"), "result": acquire}}
+
+        lease = acquire["lease"]
+        requested_environment_id = self._queue_requested_environment_id(claimed)
+        queue = self._set_queue_status(
+            claimed["id"],
+            "deploying",
+            lease_id=lease["id"],
+            environment_id=env_id,
+            metadata_update={
+                "requested_environment_id": requested_environment_id,
+                "assigned_environment_id": env_id,
+            },
+        )
+        callbacks = [
+            self._send_callback(
+                queue,
+                "dev_deploying",
+                f"Queued deploy {queue['id']} is deploying to {env_id}.",
+                lease=lease,
+            )
+        ]
+
+        deploying = self.transition(lease["id"], "mark_deploying", actor)
+        if not deploying.get("ok"):
+            error = self._callback_error("mark_deploying", deploying)
+            failed_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
+            callbacks.append(self._send_callback(
+                failed_queue,
+                self._failure_event_name(error),
+                f"Queued deploy {queue['id']} failed before deployment.",
+                lease=lease,
+                error=error,
+            ))
+            return {"ok": False, "processed": {"queue": self._public_queue(failed_queue), "result": deploying, "callbacks": callbacks}}
+
+        return {"ok": True, "queue": queue, "lease": lease, "callbacks": callbacks}
+
+    def _finish_queue_deploy(self, env: Dict[str, Any], queue: Dict[str, Any], lease: Dict[str, Any],
+                             actor: str, dry_run: bool, timeout_seconds: int,
+                             on_phase: Optional[Callable[[str, Optional[Dict[str, Any]]], None]] = None,
+                             ) -> Dict[str, Any]:
+        """Run the deploy for an already-claimed (queue, lease) pair and finalize it."""
+        env_id = str(env["id"])
+        queue_metadata = queue.get("metadata") or {}
+        queue_database_policy = normalize_database_policy(str(queue_metadata.get("database_policy") or "preflight_and_apply"))
+        result = self._deploy_acquired_lease(
+            env,
+            lease["id"],
+            env_id,
+            str(queue["task_id"]),
+            actor,
+            str(queue["source_repo_path"]),
+            queue.get("commit_sha"),
+            str(queue.get("services") or "both"),
+            bool(queue.get("health_check")),
+            dry_run,
+            timeout_seconds,
+            queue_database_policy,
+            on_phase=on_phase,
+        )
+
+        latest_lease = self._lease(lease["id"]) or lease
+        if result.get("status") == "deployed_for_qa":
+            final_queue = self._set_queue_status(queue["id"], "deployed", lease_id=lease["id"])
+            callback = self._send_callback(
+                final_queue,
+                "deployed_for_qa",
+                f"Queued deploy {queue['id']} completed and is ready for QA.",
+                lease=latest_lease,
+            )
+        else:
+            error = self._callback_error("deploy", result)
+            failure_summary = self._deploy_failure_summary(result)
+            final_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
+            callback = self._send_callback(
+                final_queue,
+                self._failure_event_name(error),
+                f"Queued deploy {queue['id']} failed: {failure_summary}.",
+                lease=latest_lease,
+                error=error,
+            )
+        return {"queue": self._public_queue(final_queue), "result": result, "callback": callback}
+
+    def _deployable_environment_for_queue(self, actor: str) -> Optional[Dict[str, Any]]:
+        for item in self.status()["environments"]:
+            env_id = str(item["environment"]["id"])
+            env = self._environment(env_id)
+            if not env:
+                continue
+            if self._active_lease(env_id):
+                continue
+            deploy_lock = inspect_native_deploy_lock(env)
+            if deploy_lock and deploy_lock.get("blocks_deploy"):
+                continue
+            queue = self._next_queued_request(env_id)
+            if queue:
+                return {"environment": env, "queue": queue}
+        return None
+
+    def claim_next_deploy(self, actor: str, worker_id: str,
+                          environment_id: Optional[str] = None,
+                          worker_pid: Optional[int] = None) -> Dict[str, Any]:
+        """Claim the next deployable queued request for the deploy worker.
+
+        Returns ``{"ok": True, "claimed": True, "queue", "lease", "callbacks"}`` when a
+        row was claimed, or ``{"ok": True, "claimed": False, "reason": ...}`` when there
+        is nothing to do. QA-fixture rows are failed in place.
+        """
+        if not actor:
+            return {"ok": False, "error": "actor is required"}
+        if worker_pid is None:
+            worker_pid = os.getpid()
+
+        if environment_id:
+            env = self._environment(str(environment_id))
+            if not env:
+                return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
+            if self._active_lease(str(environment_id)):
+                return {"ok": True, "claimed": False, "reason": "environment_busy"}
+            deploy_lock = inspect_native_deploy_lock(env)
+            if deploy_lock and deploy_lock.get("blocks_deploy"):
+                return {"ok": True, "claimed": False, "reason": "native_deploy_lock"}
+            queue = self._next_queued_request(str(environment_id))
+            if not queue:
+                return {"ok": True, "claimed": False, "reason": "queue_empty"}
+            candidate = {"environment": env, "queue": queue}
+        else:
+            candidate = self._deployable_environment_for_queue(actor)
+            if not candidate:
+                return {"ok": True, "claimed": False, "reason": "queue_empty"}
+
+        env = candidate["environment"]
+        queue = candidate["queue"]
+
+        task_rejection = qa_fixture_task_rejection(queue["task_id"]) if is_qa_fixture_task_id(queue["task_id"]) else None
+        if task_rejection:
+            error = self._callback_error("reject_qa_fixture_task", task_rejection)
+            failed_queue = self._set_queue_status(queue["id"], "failed", error=error)
+            callback = self._send_callback(
+                failed_queue,
+                self._failure_event_name(error),
+                f"Queued deploy {queue['id']} rejected: {task_rejection['message']}",
+                error=error,
+            )
+            return {"ok": True, "claimed": False, "reason": "qa_fixture_task", "queue": self._public_queue(failed_queue), "callbacks": [callback]}
+
+        begin = self._begin_queue_deploy(env, queue, actor, worker_id=worker_id, worker_pid=worker_pid)
+        if not begin.get("ok"):
+            return {"ok": True, "claimed": False, "reason": "claim_failed", **begin}
+        return {"ok": True, "claimed": True, "environment": env, **begin}
+
+    def execute_claimed_deploy(self, env: Dict[str, Any], queue: Dict[str, Any], lease: Dict[str, Any],
+                               actor: str, dry_run: bool = False, timeout_seconds: int = 1800,
+                               on_phase: Optional[Callable[[str, Optional[Dict[str, Any]]], None]] = None,
+                               ) -> Dict[str, Any]:
+        """Run a deploy the worker has already claimed via :meth:`claim_next_deploy`."""
+        finished = self._finish_queue_deploy(env, queue, lease, actor, dry_run, timeout_seconds, on_phase=on_phase)
+        return {"ok": True, **finished}
+
+    def update_deploy_heartbeat(self, queue_id: str, phase: Optional[str] = None) -> None:
+        """Record deploy progress so the reconciler can tell a live deploy from a dead one."""
+        now = utc_now()
+        if phase is not None:
+            self.conn.execute(
+                "UPDATE deploy_queue SET heartbeat_at = ?, updated_at = ?, phase = ? WHERE id = ?",
+                (now, now, phase, queue_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE deploy_queue SET heartbeat_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, queue_id),
+            )
+
+    def _deploy_orphan_after_seconds(self, override: Optional[int] = None) -> int:
+        if override is not None and int(override) > 0:
+            return int(override)
+        configured = getattr(self.config, "deploy_orphan_after_seconds", None)
+        return int(configured) if configured else 600
+
+    def _queue_deploy_is_orphaned(self, queue: Dict[str, Any], env: Optional[Dict[str, Any]],
+                                  orphan_after_seconds: int, now_dt: datetime) -> bool:
+        if queue.get("status") != "deploying":
+            return False
+        pid = queue.get("worker_pid")
+        pid_alive = process_alive(pid) if pid not in (None, "") else None
+        if pid_alive is False:
+            return True
+        last_progress = parse_time(str(
+            queue.get("heartbeat_at") or queue.get("started_at") or queue.get("claimed_at") or ""
+        )) if (queue.get("heartbeat_at") or queue.get("started_at") or queue.get("claimed_at")) else None
+        if last_progress is None:
+            return False
+        if (now_dt - last_progress).total_seconds() <= orphan_after_seconds:
+            return False
+        # Past the grace window: a genuinely running native deploy still holds the
+        # environment's deploy.lock, so only treat it as orphaned when no lock is held.
+        if env is not None:
+            lock = inspect_native_deploy_lock(env)
+            if lock and any(bool(entry.get("locked")) for entry in lock.get("entries", [])):
+                return False
+        return True
+
+    def reconcile_stuck_deploys(self, actor: str, environment_id: Optional[str] = None,
+                                orphan_after_seconds: Optional[int] = None,
+                                dry_run: bool = False) -> Dict[str, Any]:
+        """Fail deploy rows whose owning process died mid-deploy.
+
+        Without this, an interrupted deploy leaves the queue row in ``deploying`` and
+        the lease active forever, wedging Agent HQ at ``dev_deploying``. We detect the
+        orphan via a dead worker pid or a stale heartbeat with no held deploy lock,
+        then fail the row, release the lease, and fire the ``deploy_failed`` callback.
+        """
+        if not actor:
+            return {"ok": False, "error": "actor is required"}
+        threshold = self._deploy_orphan_after_seconds(orphan_after_seconds)
+        now_dt = parse_time(utc_now())
+        clauses = ["status = 'deploying'"]
+        params: list[Any] = []
+        if environment_id:
+            clauses.append("environment_id = ?")
+            params.append(str(environment_id))
+        rows = self.conn.execute(
+            f"SELECT * FROM deploy_queue WHERE {' AND '.join(clauses)}",
+            tuple(params),
+        ).fetchall()
+
+        reconciled: list[Dict[str, Any]] = []
+        for row in rows:
+            queue = row_to_dict(row)
+            if not queue:
+                continue
+            env = self._environment(str(queue["environment_id"]))
+            if not self._queue_deploy_is_orphaned(queue, env, threshold, now_dt):
+                continue
+            if dry_run:
+                reconciled.append({"queue": self._public_queue(queue), "dry_run": True})
+                continue
+            reconciled.append(self._reconcile_orphaned_deploy(queue, actor))
+
+        return {"ok": True, "reconciled": reconciled, "orphan_after_seconds": threshold, "dry_run": dry_run}
+
+    def _reconcile_orphaned_deploy(self, queue: Dict[str, Any], actor: str) -> Dict[str, Any]:
+        message = (
+            f"Deploy process for queue {queue['id']} exited before completing "
+            f"(last phase: {queue.get('phase') or 'unknown'}); no terminal result was recorded."
+        )
+        error = {
+            "stage": "deploy_interrupted",
+            "failure_class": "deploy_failed",
+            "phase": queue.get("phase"),
+            "worker_pid": queue.get("worker_pid"),
+            "worker_id": queue.get("worker_id"),
+            "heartbeat_at": queue.get("heartbeat_at"),
+        }
+        lease_id = queue.get("lease_id")
+        lease_result: Optional[Dict[str, Any]] = None
+        if lease_id:
+            lease = self._lease(str(lease_id))
+            if lease and lease.get("status") in {"deploying", "stale"}:
+                lease_result = self.release(
+                    str(lease_id),
+                    actor,
+                    "deploy_failed",
+                    message,
+                    sweep_queue_after_release=False,
+                )
+        failed_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease_id, error=error)
+        env = self._environment(str(queue["environment_id"]))
+        if env is not None:
+            try:
+                sweep_native_deploy_lock(env, actor, "reconcile orphaned deploy", force=False)
+            except Exception:
+                pass
+        callback = self._send_callback(
+            failed_queue,
+            "deploy_failed",
+            message,
+            lease=self._lease(str(lease_id)) if lease_id else None,
+            error=error,
+        )
+        return {
+            "queue": self._public_queue(failed_queue),
+            "lease_release": lease_result,
+            "callback": callback,
+        }
 
     def sweep_deploy_queue(self, actor: str, environment_id: Optional[str] = None,
                            limit: int = 1, dry_run: bool = False,
@@ -2098,98 +2564,20 @@ class LeaseManager:
                 processed.append({"queue": self._public_queue(failed_queue), "result": task_rejection, "callbacks": callbacks})
                 continue
 
-            acquire = self.acquire(
-                str(env_id),
-                str(queue["task_id"]),
-                actor,
-                queue.get("agent_id"),
-                queue.get("agent_name"),
-                queue.get("branch"),
-                queue.get("commit_sha"),
-                {
-                    "source_repo_path": queue.get("source_repo_path"),
-                    "queue_id": queue["id"],
-                },
-                supersede_same_task_review=True,
-            )
-            if not acquire.get("ok"):
-                skipped.append({"environment_id": env_id, "queue": self._public_queue(queue), "reason": acquire.get("error"), "result": acquire})
+            begin = self._begin_queue_deploy(env, queue, actor)
+            if not begin.get("ok"):
+                if "processed" in begin:
+                    processed.append(begin["processed"])
+                else:
+                    skipped.append(begin.get("skipped") or {"environment_id": env_id, "reason": "claim_failed"})
                 continue
 
-            lease = acquire["lease"]
-            requested_environment_id = self._queue_requested_environment_id(queue)
-            queue = self._set_queue_status(
-                queue["id"],
-                "deploying",
-                lease_id=lease["id"],
-                environment_id=str(env_id),
-                metadata_update={
-                    "requested_environment_id": requested_environment_id,
-                    "assigned_environment_id": str(env_id),
-                },
-            )
-            callbacks = [
-                self._send_callback(
-                    queue,
-                    "dev_deploying",
-                    f"Queued deploy {queue['id']} is deploying to {env_id}.",
-                    lease=lease,
-                )
-            ]
-
-            deploying = self.transition(lease["id"], "mark_deploying", actor)
-            if not deploying.get("ok"):
-                error = self._callback_error("mark_deploying", deploying)
-                failed_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
-                callbacks.append(self._send_callback(
-                    failed_queue,
-                    self._failure_event_name(error),
-                    f"Queued deploy {queue['id']} failed before deployment.",
-                    lease=lease,
-                    error=error,
-                ))
-                processed.append({"queue": self._public_queue(failed_queue), "result": deploying, "callbacks": callbacks})
-                continue
-
-            queue_metadata = queue.get("metadata") or {}
-            queue_database_policy = normalize_database_policy(str(queue_metadata.get("database_policy") or "preflight_and_apply"))
-            result = self._deploy_acquired_lease(
-                env,
-                lease["id"],
-                str(env_id),
-                str(queue["task_id"]),
-                actor,
-                str(queue["source_repo_path"]),
-                queue.get("commit_sha"),
-                str(queue.get("services") or "both"),
-                bool(queue.get("health_check")),
-                dry_run,
-                timeout_seconds,
-                queue_database_policy,
-            )
-
-            latest_lease = self._lease(lease["id"]) or lease
-            if result.get("status") == "deployed_for_qa":
-                final_queue = self._set_queue_status(queue["id"], "deployed", lease_id=lease["id"])
-                callbacks.append(self._send_callback(
-                    final_queue,
-                    "deployed_for_qa",
-                    f"Queued deploy {queue['id']} completed and is ready for QA.",
-                    lease=latest_lease,
-                ))
-            else:
-                error = self._callback_error("deploy", result)
-                failure_summary = self._deploy_failure_summary(result)
-                final_queue = self._set_queue_status(queue["id"], "failed", lease_id=lease["id"], error=error)
-                callbacks.append(self._send_callback(
-                    final_queue,
-                    self._failure_event_name(error),
-                    f"Queued deploy {queue['id']} failed: {failure_summary}.",
-                    lease=latest_lease,
-                    error=error,
-                ))
-
-            processed.append({"queue": self._public_queue(final_queue), "result": result, "callbacks": callbacks})
+            lease = begin["lease"]
+            queue = begin["queue"]
+            callbacks = list(begin["callbacks"])
+            finished = self._finish_queue_deploy(env, queue, lease, actor, dry_run, timeout_seconds)
+            callbacks.append(finished["callback"])
+            processed.append({"queue": finished["queue"], "result": finished["result"], "callbacks": callbacks})
 
         return {"ok": True, "processed": processed, "skipped": skipped}
 

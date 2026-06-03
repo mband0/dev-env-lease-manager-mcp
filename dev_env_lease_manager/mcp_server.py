@@ -19,6 +19,7 @@ class LeaseManagerMcpTools:
     def _preflight_cleanup_has_reportable_changes(self, cleanup: Dict[str, Any]) -> bool:
         stale_leases = cleanup.get("stale_leases") or {}
         deploy_locks = cleanup.get("deploy_locks") or {}
+        orphaned_deploys = cleanup.get("orphaned_deploys") or {}
         return (
             not bool(cleanup.get("ok", False))
             or bool(stale_leases.get("marked_stale"))
@@ -26,6 +27,50 @@ class LeaseManagerMcpTools:
             or bool(stale_leases.get("skipped"))
             or bool(deploy_locks.get("removed"))
             or any(bool(entry.get("stale")) for entry in deploy_locks.get("skipped", []))
+            or bool(orphaned_deploys.get("reconciled"))
+        )
+
+    def _deploy_worktree(self, a: Dict[str, Any]) -> Dict[str, Any]:
+        # Default: hand the deploy to the background worker and return immediately so
+        # the call can't be killed mid-deploy. dry_run and an explicit synchronous
+        # escape hatch still run inline via lease_aware_deploy.
+        synchronous = bool(a.get("synchronous", False)) or bool(a.get("dry_run", False))
+        if synchronous:
+            return self.manager.lease_aware_deploy(
+                a["environment_id"],
+                a["task_id"],
+                a["actor"],
+                a["source_repo_path"],
+                a.get("agent_id"),
+                a.get("agent_name"),
+                a.get("branch"),
+                a.get("commit"),
+                a.get("services", "both"),
+                bool(a.get("health_check", True)),
+                bool(a.get("dry_run", False)),
+                queue_if_busy=bool(a.get("queue_if_busy", False)),
+                priority=int(a.get("priority") or 0),
+                callback_url=a.get("callback_url"),
+                callback_api_key=a.get("callback_api_key"),
+                timeout_seconds=int(a.get("timeout_seconds") or DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS),
+                database_policy=a.get("database_policy", "preflight_and_apply"),
+            )
+        return self.manager.deploy_worktree_async(
+            a["environment_id"],
+            a["task_id"],
+            a["actor"],
+            a["source_repo_path"],
+            agent_id=a.get("agent_id"),
+            agent_name=a.get("agent_name"),
+            branch=a.get("branch"),
+            commit=a.get("commit"),
+            services=a.get("services", "both"),
+            health_check=bool(a.get("health_check", True)),
+            priority=int(a.get("priority") or 0),
+            callback_url=a.get("callback_url"),
+            callback_api_key=a.get("callback_api_key"),
+            database_policy=a.get("database_policy", "preflight_and_apply"),
+            wait_seconds=int(a.get("wait_seconds") or 0),
         )
 
     def call_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -75,6 +120,12 @@ class LeaseManagerMcpTools:
             ),
             "dev_env_heartbeat": lambda a: self.manager.heartbeat(a["lease_id"], a["actor"]),
             "dev_env_sweep_stale": lambda a: self.manager.sweep_stale(a["actor"]),
+            "dev_env_reconcile_stuck_deploys": lambda a: self.manager.reconcile_stuck_deploys(
+                a["actor"],
+                a.get("environment_id"),
+                int(a["orphan_after_seconds"]) if a.get("orphan_after_seconds") is not None else None,
+                bool(a.get("dry_run", False)),
+            ),
             "dev_env_sweep_deploy_queue": lambda a: self.manager.sweep_deploy_queue(
                 a["actor"],
                 a.get("environment_id"),
@@ -118,25 +169,7 @@ class LeaseManagerMcpTools:
                 bool(a.get("delete_local", True)),
                 bool(a.get("delete_remote", True)),
             ),
-            "dev_env_deploy_worktree": lambda a: self.manager.lease_aware_deploy(
-                a["environment_id"],
-                a["task_id"],
-                a["actor"],
-                a["source_repo_path"],
-                a.get("agent_id"),
-                a.get("agent_name"),
-                a.get("branch"),
-                a.get("commit"),
-                a.get("services", "both"),
-                bool(a.get("health_check", True)),
-                bool(a.get("dry_run", False)),
-                queue_if_busy=bool(a.get("queue_if_busy", False)),
-                priority=int(a.get("priority") or 0),
-                callback_url=a.get("callback_url"),
-                callback_api_key=a.get("callback_api_key"),
-                timeout_seconds=int(a.get("timeout_seconds") or DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS),
-                database_policy=a.get("database_policy", "preflight_and_apply"),
-            ),
+            "dev_env_deploy_worktree": lambda a: self._deploy_worktree(a),
         }
         if name not in handlers:
             return {"ok": False, "error": "unknown_tool", "tool": name}
@@ -342,6 +375,26 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
         })
 
     @mcp.tool()
+    def dev_env_reconcile_stuck_deploys(
+        actor: str,
+        environment_id: Optional[str] = None,
+        orphan_after_seconds: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Fail deploy queue rows orphaned by an interrupted deploy process.
+
+        Detects rows stuck in ``deploying`` whose worker process is gone (dead pid or
+        stale heartbeat with no held deploy lock), fails them, releases the lease, and
+        fires the ``deploy_failed`` callback so Agent HQ leaves ``dev_deploying``.
+        """
+        return service.call_tool("dev_env_reconcile_stuck_deploys", {
+            "actor": actor,
+            "environment_id": environment_id,
+            "orphan_after_seconds": orphan_after_seconds,
+            "dry_run": dry_run,
+        })
+
+    @mcp.tool()
     def dev_env_sweep_deploy_locks(
         actor: str,
         reason: str,
@@ -456,12 +509,18 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
         callback_api_key: Optional[str] = None,
         timeout_seconds: int = DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS,
         database_policy: str = "preflight_and_apply",
+        wait_seconds: int = 0,
+        synchronous: bool = False,
     ) -> Dict[str, Any]:
-        """Lease-aware deploy wrapper around the configured deploy command.
+        """Lease-aware deploy. Hands execution to the background deploy worker.
 
-        The MCP default deploy timeout is slightly below OpenClaw's 3-minute
-        tool boundary so agents receive a structured deploy error instead of a
-        generic MCP request timeout.
+        By default this enqueues the deploy and returns ``status: accepted`` with a
+        ``queue_id`` immediately, so the call cannot be killed mid-deploy by the
+        tool-call boundary. The outcome arrives via the Agent HQ callback
+        (``deployed_for_qa`` / ``deploy_failed``); poll ``dev_env_queue_status`` or
+        pass ``wait_seconds`` to block this call (bounded) for the terminal result.
+
+        ``dry_run`` and ``synchronous=True`` run the deploy inline instead.
         """
         return service.call_tool("dev_env_deploy_worktree", {
             "environment_id": environment_id,
@@ -481,6 +540,8 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
             "callback_api_key": callback_api_key,
             "timeout_seconds": timeout_seconds,
             "database_policy": database_policy,
+            "wait_seconds": wait_seconds,
+            "synchronous": synchronous,
         })
 
     return mcp

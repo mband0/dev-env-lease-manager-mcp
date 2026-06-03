@@ -12,6 +12,7 @@ dependencies = [
 [project.scripts]
 dev-env-lease = "dev_env_lease_manager.cli:main"
 dev-env-lease-mcp = "dev_env_lease_manager.mcp_server:main"
+dev-env-deploy-worker = "dev_env_lease_manager.worker:main"
 
 [tool.setuptools]
 packages = ["dev_env_lease_manager"]

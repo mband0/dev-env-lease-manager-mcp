@@ -30,6 +30,7 @@ released leases and removed lock entries.
 - `dev_env_heartbeat`
 - `dev_env_sweep_stale`
 - `dev_env_sweep_deploy_queue`
+- `dev_env_reconcile_stuck_deploys`
 - `dev_env_sweep_deploy_locks`
 - `dev_env_cancel_queue`
 - `dev_env_validate_qa`
@@ -38,12 +39,50 @@ released leases and removed lock entries.
 - `dev_env_cleanup_task_branch`
 - `dev_env_deploy_worktree`
 
-`dev_env_deploy_worktree` is the normal dev promotion tool. For environments
-with `metadata.deploy_mode = "native"`, the MCP server itself performs the
+`dev_env_deploy_worktree` is the normal dev promotion tool. By default it is
+**asynchronous**: it authorizes the request, enqueues a durable deploy, and
+returns `status: "accepted"` with a `queue_id` immediately, so the deploy cannot
+be killed mid-flight by the MCP/OpenClaw tool-call boundary. The actual build,
+migration, restart, health check, and lease transition run in the background
+`dev-env-deploy-worker` process (see below); the outcome arrives via the Agent HQ
+`deployed_for_qa` / `deploy_failed` callback. Poll `dev_env_queue_status` for
+progress, or pass `wait_seconds` to block the call (bounded, max 600s) for the
+terminal result. Pass `synchronous: true` (or `dry_run: true`) to run the deploy
+inline in the calling process instead.
+
+For environments with `metadata.deploy_mode = "native"`, the worker performs the
 persistent dev checkout promotion, build, database migration preflight/apply,
 PM2 restart, health check, served commit verification, and lease transition.
 Environments can still opt into the legacy external command path with
 `metadata.deploy_mode = "command"`.
+
+### Background deploy worker and reconciliation
+
+Native deploys take minutes — longer than the tool-call boundary — so execution
+is decoupled from the caller. Run the worker under pm2 alongside the dev API/UI:
+
+```
+pm2 start dev-env-deploy-worker --name agent-hq-dev-deploy-worker -- \
+  --config <path-to>/config/environments.json
+```
+
+The worker must have `AGENT_HQ_MCP_API_KEY` (and, if not in the config,
+`agent_hq.base_url`) in its environment so it can send callbacks. It claims one
+queued request at a time (atomically, guarded by the per-environment active-lease
+index), heartbeats progress per phase into `deploy_queue.heartbeat_at`/`phase`,
+and writes the terminal status + callback itself.
+
+Every worker tick — and `dev_env_reconcile_stuck_deploys`, and the preflight that
+runs before every MCP tool call — reconciles **orphaned** deploys: a row stuck in
+`deploying` whose worker process is gone (dead `worker_pid`, or a stale heartbeat
+past `deploy_orphan_after_seconds` with no held `deploy.lock`) is failed in place,
+its lease released as `deploy_failed`, and a `deploy_failed` callback is sent so
+Agent HQ leaves `dev_deploying`. `deploy_orphan_after_seconds` (default 600) and
+`deploy_worker_poll_interval_seconds` (default 5) are configurable in
+`environments.json`.
+
+If the worker is down, `dev_env_sweep_deploy_queue` still drains the queue
+synchronously as a degraded-mode fallback.
 
 `dev_env_deploy_worktree` accepts `database_policy`, defaulting to
 `preflight_and_apply`. Native API deploys use it to run migration status checks,
