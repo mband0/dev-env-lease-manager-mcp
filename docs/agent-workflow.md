@@ -22,9 +22,9 @@ QA agents:
 
 Release agents:
 
-1. Call `dev_env_mark_prod_deploying` before production deployment.
-2. If production deployment fails, call `dev_env_mark_prod_failed`.
-3. After production succeeds and the Agent HQ task reaches done, call `dev_env_mark_done`.
+1. Call `dev_env_deploy_production` with `dry_run = true` and inspect the plan.
+2. Call `dev_env_deploy_production` with `dry_run = false` to run the exact-commit production deploy.
+3. Use the returned `production_evidence` for release notes and branch cleanup.
 
 Operators:
 

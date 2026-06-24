@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 
-from dev_env_lease_manager.deploy import NativeDeployError, NativeDevDeployer, commit_matches_expected, normalize_services
+from dev_env_lease_manager.deploy import NativeDeployError, NativeDevDeployer, NativeProductionDeployer, commit_matches_expected, normalize_services
 
 
 def write_package(path: Path, scripts: dict[str, str]) -> None:
@@ -59,6 +59,41 @@ class NativeDeployTests(unittest.TestCase):
             elif args[:4] == ["git", "-C", dev_path, "rev-parse"] and args[4:] == ["FETCH_HEAD"]:
                 stdout = "abc123\n"
             elif args[:4] == ["git", "-C", dev_path, "reset"]:
+                stdout = "HEAD is now at abc123\n"
+            elif args == ["pm2", "jlist"]:
+                stdout = "[]"
+            return subprocess.CompletedProcess(args, returncode, stdout, "")
+
+        return run
+
+    def fake_production_runner(self, repo: Path, commands: list[list[str]], command_envs: list[tuple[list[str], dict[str, str]]] | None = None):
+        repo_path = str(repo.resolve())
+
+        def run(args, cwd=None, env=None, text=True, capture_output=True, timeout=None):
+            commands.append(list(args))
+            if command_envs is not None:
+                command_envs.append((list(args), dict(env or {})))
+            stdout = ""
+            returncode = 0
+            if args[:4] == ["git", "-C", repo_path, "rev-parse"] and args[4:] == ["--show-toplevel"]:
+                stdout = f"{repo_path}\n"
+            elif args[:4] == ["git", "-C", repo_path, "status"]:
+                stdout = ""
+            elif args[:4] == ["git", "-C", repo_path, "diff"]:
+                returncode = 0
+            elif args[:4] == ["git", "-C", repo_path, "ls-files"]:
+                stdout = ""
+            elif args[:4] == ["git", "-C", repo_path, "fetch"]:
+                stdout = ""
+            elif args[:4] == ["git", "-C", repo_path, "rev-parse"] and args[4:] == ["abc123^{commit}"]:
+                stdout = "abc123\n"
+            elif args[:4] == ["git", "-C", repo_path, "merge-base"]:
+                returncode = 0
+            elif args[:4] == ["git", "-C", repo_path, "rev-parse"] and args[4:] == ["origin/main"]:
+                stdout = "abc123\n"
+            elif args[:4] == ["git", "-C", repo_path, "rev-parse"] and args[4:] == ["HEAD"]:
+                stdout = "abc123\n"
+            elif args[:4] == ["git", "-C", repo_path, "reset"]:
                 stdout = "HEAD is now at abc123\n"
             elif args == ["pm2", "jlist"]:
                 stdout = "[]"
@@ -347,6 +382,155 @@ class NativeDeployTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.error, "database_migration_failed")
         self.assertNotIn(["pm2", "delete", "agent-hq-dev-api"], commands)
+
+    def test_production_deploy_dry_run_validates_exact_commit_without_mutation(self) -> None:
+        _, _, prod, _ = self.make_layout()
+        write_package(prod / "ui/package.json", {"build": "next build", "start": "next start"})
+        commands: list[list[str]] = []
+        deployer = NativeProductionDeployer(self.fake_production_runner(prod, commands))
+
+        result = deployer.deploy(
+            {
+                "id": "agent-hq-dev",
+                "metadata": {
+                    "production_repo_path": str(prod),
+                    "production_state_dir": str(prod.parent / "prod-state"),
+                },
+            },
+            health_check=False,
+            expected_commit="abc123",
+            dry_run=True,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["commit_check"]["resolved_commit"], "abc123")
+        self.assertIn(["git", "-C", str(prod.resolve()), "fetch", "--no-tags", "origin", "main"], commands)
+        self.assertNotIn(["git", "-C", str(prod.resolve()), "reset", "--hard", "abc123"], commands)
+        self.assertNotIn(["pm2", "delete", "agent-hq-api"], commands)
+
+    def test_production_deploy_refuses_commit_not_reachable_from_remote(self) -> None:
+        _, _, prod, _ = self.make_layout()
+        write_package(prod / "ui/package.json", {"build": "next build", "start": "next start"})
+        prod_path = str(prod.resolve())
+
+        def runner(args, cwd=None, env=None, text=True, capture_output=True, timeout=None):
+            if args[:4] == ["git", "-C", prod_path, "rev-parse"] and args[4:] == ["--show-toplevel"]:
+                return subprocess.CompletedProcess(args, 0, f"{prod_path}\n", "")
+            if args[:4] == ["git", "-C", prod_path, "status"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:4] == ["git", "-C", prod_path, "diff"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:4] == ["git", "-C", prod_path, "ls-files"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:4] == ["git", "-C", prod_path, "rev-parse"] and args[4:] == ["abc123^{commit}"]:
+                return subprocess.CompletedProcess(args, 0, "abc123\n", "")
+            if args[:4] == ["git", "-C", prod_path, "merge-base"]:
+                return subprocess.CompletedProcess(args, 1, "", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with self.assertRaises(NativeDeployError) as caught:
+            NativeProductionDeployer(runner).deploy(
+                {"id": "agent-hq-dev", "metadata": {"production_repo_path": str(prod)}},
+                health_check=False,
+                expected_commit="abc123",
+                dry_run=True,
+            )
+
+        self.assertEqual(caught.exception.error, "expected_commit_not_reachable_from_remote")
+
+    def test_production_deploy_refuses_dirty_tracked_checkout(self) -> None:
+        _, _, prod, _ = self.make_layout()
+        write_package(prod / "ui/package.json", {"build": "next build", "start": "next start"})
+        prod_path = str(prod.resolve())
+
+        def runner(args, cwd=None, env=None, text=True, capture_output=True, timeout=None):
+            if args[:4] == ["git", "-C", prod_path, "rev-parse"] and args[4:] == ["--show-toplevel"]:
+                return subprocess.CompletedProcess(args, 0, f"{prod_path}\n", "")
+            if args[:4] == ["git", "-C", prod_path, "status"]:
+                return subprocess.CompletedProcess(args, 0, " M api/src/index.ts\n", "")
+            if args[:4] == ["git", "-C", prod_path, "diff"]:
+                return subprocess.CompletedProcess(args, 1, "", "")
+            if args[:4] == ["git", "-C", prod_path, "ls-files"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with self.assertRaises(NativeDeployError) as caught:
+            NativeProductionDeployer(runner).deploy(
+                {"id": "agent-hq-dev", "metadata": {"production_repo_path": str(prod)}},
+                health_check=False,
+                expected_commit="abc123",
+                dry_run=True,
+            )
+
+        self.assertEqual(caught.exception.error, "production_checkout_dirty")
+
+    def test_production_deploy_allows_known_build_artifacts_untracked(self) -> None:
+        _, _, prod, _ = self.make_layout()
+        write_package(prod / "ui/package.json", {"build": "next build", "start": "next start"})
+        prod_path = str(prod.resolve())
+
+        def runner(args, cwd=None, env=None, text=True, capture_output=True, timeout=None):
+            if args[:4] == ["git", "-C", prod_path, "rev-parse"] and args[4:] == ["--show-toplevel"]:
+                return subprocess.CompletedProcess(args, 0, f"{prod_path}\n", "")
+            if args[:4] == ["git", "-C", prod_path, "status"]:
+                return subprocess.CompletedProcess(args, 0, "?? api/dist/index.js\n?? ui/.next/build-manifest.json\n", "")
+            if args[:4] == ["git", "-C", prod_path, "diff"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:4] == ["git", "-C", prod_path, "ls-files"]:
+                return subprocess.CompletedProcess(args, 0, "api/dist/index.js\nui/.next/build-manifest.json\n", "")
+            if args[:4] == ["git", "-C", prod_path, "rev-parse"] and args[4:] == ["abc123^{commit}"]:
+                return subprocess.CompletedProcess(args, 0, "abc123\n", "")
+            if args[:4] == ["git", "-C", prod_path, "merge-base"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:4] == ["git", "-C", prod_path, "rev-parse"] and args[4:] in (["origin/main"], ["HEAD"]):
+                return subprocess.CompletedProcess(args, 0, "abc123\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        result = NativeProductionDeployer(runner).deploy(
+            {"id": "agent-hq-dev", "metadata": {"production_repo_path": str(prod)}},
+            health_check=False,
+            expected_commit="abc123",
+            dry_run=True,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["checkout_safety"]["disallowed_untracked"], [])
+
+    def test_production_deploy_restarts_exact_commit_on_success(self) -> None:
+        _, _, prod, _ = self.make_layout()
+        write_package(prod / "ui/package.json", {"build": "next build", "start": "next start"})
+        commands: list[list[str]] = []
+        command_envs: list[tuple[list[str], dict[str, str]]] = []
+        deployer = NativeProductionDeployer(self.fake_production_runner(prod, commands, command_envs))
+
+        result = deployer.deploy(
+            {
+                "id": "agent-hq-dev",
+                "metadata": {
+                    "production_repo_path": str(prod),
+                    "production_state_dir": str(prod.parent / "prod-state"),
+                    "production_db_path": str(prod / "agent-hq.db"),
+                },
+            },
+            health_check=False,
+            expected_commit="abc123",
+            dry_run=False,
+            database_policy="none",
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(result["deployed_commit"], "abc123")
+        self.assertIn(["git", "-C", str(prod.resolve()), "reset", "--hard", "abc123"], commands)
+        self.assertIn(["pm2", "start", "npm", "--name", "agent-hq-api", "--cwd", str(prod.resolve() / "api"), "--", "start"], commands)
+        self.assertIn(["pm2", "start", "npm", "--name", "agent-hq-ui", "--cwd", str(prod.resolve() / "ui"), "--", "run", "start"], commands)
+        api_start_env = next(
+            env for command, env in command_envs
+            if command == ["pm2", "start", "npm", "--name", "agent-hq-api", "--cwd", str(prod.resolve() / "api"), "--", "start"]
+        )
+        self.assertEqual(api_start_env["PORT"], "3501")
+        self.assertEqual(api_start_env["AGENT_HQ_APP_COMMIT"], "abc123")
 
 
 if __name__ == "__main__":

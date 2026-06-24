@@ -11,6 +11,11 @@ The MCP server also owns the normal Agent HQ dev promotion path. Its
 the persistent dev checkout, build/restart the configured PM2 services, verify
 health and served commit, then keep the lease locked for QA.
 
+It also exposes `dev_env_deploy_production` for release agents. That tool
+validates the approved QA lease and exact commit, takes a separate production
+deploy lock, updates production to that exact commit, builds/migrates/restarts,
+health-checks, and releases the lease as `done` or `prod_failed` with evidence.
+
 ## Quick Start
 
 ```sh
@@ -33,6 +38,7 @@ python3.11 -m venv .venv
 .venv/bin/dev-env-lease queue-status --environment-id agent-hq-dev
 .venv/bin/dev-env-lease sweep-deploy-queue --environment-id agent-hq-dev --actor queue-worker
 .venv/bin/dev-env-lease sweep-deploy-locks --environment-id agent-hq-dev --actor operator:admin --reason stale-native-lock
+.venv/bin/dev-env-lease deploy-production agent-hq-dev --lease-id <lease> --task-id 426 --actor release --expected-commit abc123 --execute
 .venv/bin/dev-env-lease callback-attempts --task-id 448
 ```
 

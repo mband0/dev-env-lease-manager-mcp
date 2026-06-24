@@ -18,6 +18,7 @@ from .deploy import (
     DEPLOY_FAILURE_EVENTS,
     NativeDeployError,
     NativeDevDeployer,
+    NativeProductionDeployer,
     commit_matches_expected,
     inspect_native_deploy_lock,
     normalize_database_policy,
@@ -1767,6 +1768,116 @@ class LeaseManager:
         if message:
             lines.append(f"Message: {message}")
         return "\n".join(lines)
+
+    def deploy_production(self, environment_id: str, lease_id: str, task_id: str, actor: str,
+                          expected_commit: str, services: str = "both", health_check: bool = True,
+                          dry_run: bool = True, timeout_seconds: int = 1800,
+                          database_policy: str = "preflight_and_apply") -> Dict[str, Any]:
+        if not actor:
+            return {"ok": False, "error": "actor is required"}
+        task_rejection = qa_fixture_task_rejection(task_id) if is_qa_fixture_task_id(task_id) else None
+        if task_rejection:
+            return task_rejection
+        env = self._environment(environment_id)
+        if not env:
+            return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
+        lease = self._lease(lease_id)
+        if not lease:
+            return {"ok": False, "error": "lease_not_found", "lease_id": lease_id}
+        if str(lease.get("environment_id")) != str(environment_id):
+            return {
+                "ok": False,
+                "error": "environment_integrity_failure",
+                "errors": [f"lease environment_id {lease.get('environment_id')} does not match {environment_id}"],
+                "lease": lease,
+            }
+        qa = self.validate_qa(task_id, expected_commit, environment_id, lease_id)
+        if not qa.get("ok"):
+            return qa
+        if lease.get("status") != "deployed_for_qa":
+            return {
+                "ok": False,
+                "error": "invalid_production_deploy_state",
+                "lease_id": lease_id,
+                "from_status": lease.get("status"),
+                "allowed_from": ["deployed_for_qa"],
+            }
+        database_policy = normalize_database_policy(database_policy)
+        if dry_run:
+            try:
+                deploy_payload = NativeProductionDeployer().deploy(
+                    env,
+                    services=services,
+                    health_check=health_check,
+                    expected_commit=expected_commit,
+                    timeout_seconds=timeout_seconds,
+                    database_policy=database_policy,
+                    dry_run=True,
+                    lock_metadata={
+                        "lease_id": lease_id,
+                        "task_id": task_id,
+                        "actor": actor,
+                        "commit": expected_commit,
+                    },
+                )
+                return {"ok": True, "status": "dry_run", "lease": lease, "production_deploy": deploy_payload}
+            except NativeDeployError as exc:
+                payload = exc.payload()
+                return {"ok": False, "status": "dry_run_failed", "lease": lease, "production_deploy": payload, **payload}
+
+        try:
+            prod_transition = self.transition(
+                lease_id,
+                "mark_prod_deploying",
+                actor,
+                {"expected_commit": expected_commit, "services": services, "database_policy": database_policy},
+            )
+            if not prod_transition.get("ok"):
+                return prod_transition
+            deploy_payload = NativeProductionDeployer().deploy(
+                env,
+                services=services,
+                health_check=health_check,
+                expected_commit=expected_commit,
+                timeout_seconds=timeout_seconds,
+                database_policy=database_policy,
+                dry_run=False,
+                lock_metadata={
+                    "lease_id": lease_id,
+                    "task_id": task_id,
+                    "actor": actor,
+                    "commit": expected_commit,
+                },
+            )
+            release = self.release(
+                lease_id,
+                actor,
+                "done",
+                f"Production deployed exact commit {deploy_payload.get('deployed_commit') or expected_commit}",
+            )
+            release["production_deploy"] = deploy_payload
+            release["production_evidence"] = {
+                "task_id": task_id,
+                "lease_id": lease_id,
+                "environment_id": environment_id,
+                "expected_commit": expected_commit,
+                "deployed_commit": deploy_payload.get("deployed_commit"),
+                "services": deploy_payload.get("services"),
+                "health": deploy_payload.get("health"),
+                "state_file": deploy_payload.get("state_file"),
+            }
+            return release
+        except NativeDeployError as exc:
+            deploy_payload = exc.payload()
+            release = self.release(
+                lease_id,
+                actor,
+                "prod_failed",
+                deploy_payload.get("error", "production deploy failed"),
+                sweep_queue_after_release=False,
+            )
+            release["production_deploy"] = deploy_payload
+            return release
 
     def _deploy_acquired_lease(self, env: Dict[str, Any], lease_id: str, environment_id: str,
                                task_id: str, actor: str, source_repo_path: str,

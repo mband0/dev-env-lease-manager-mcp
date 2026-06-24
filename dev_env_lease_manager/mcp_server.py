@@ -99,6 +99,18 @@ class LeaseManagerMcpTools:
                 a.get("environment_id"),
                 a.get("lease_id"),
             ),
+            "dev_env_deploy_production": lambda a: self.manager.deploy_production(
+                a["environment_id"],
+                a["lease_id"],
+                a["task_id"],
+                a["actor"],
+                a["expected_commit"],
+                a.get("services", "both"),
+                bool(a.get("health_check", True)),
+                bool(a.get("dry_run", True)),
+                int(a.get("timeout_seconds") or DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS),
+                a.get("database_policy", "preflight_and_apply"),
+            ),
             "dev_env_events": lambda a: self.manager.events(a["lease_id"]),
             "dev_env_callback_attempts": lambda a: self.manager.callback_attempts(
                 a.get("queue_id"),
@@ -382,6 +394,39 @@ def create_mcp_server(manager: LeaseManager) -> FastMCP:
             "commit": commit,
             "lease_id": lease_id,
             "environment_id": environment_id,
+        })
+
+    @mcp.tool()
+    def dev_env_deploy_production(
+        environment_id: str,
+        lease_id: str,
+        task_id: str,
+        actor: str,
+        expected_commit: str,
+        services: str = "both",
+        health_check: bool = True,
+        dry_run: bool = True,
+        timeout_seconds: int = DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS,
+        database_policy: str = "preflight_and_apply",
+    ) -> Dict[str, Any]:
+        """Deploy an approved QA commit to production using exact-commit evidence.
+
+        Dry run is the default. A real deployment validates the lease/task/commit,
+        marks the lease prod_deploying, updates production to the exact approved
+        commit, builds, migrates, restarts PM2, health-checks, then releases done
+        or prod_failed with structured deploy evidence.
+        """
+        return service.call_tool("dev_env_deploy_production", {
+            "environment_id": environment_id,
+            "lease_id": lease_id,
+            "task_id": task_id,
+            "actor": actor,
+            "expected_commit": expected_commit,
+            "services": services,
+            "health_check": health_check,
+            "dry_run": dry_run,
+            "timeout_seconds": timeout_seconds,
+            "database_policy": database_policy,
         })
 
     @mcp.tool()

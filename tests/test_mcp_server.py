@@ -172,6 +172,24 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(deploy.call_args.kwargs["timeout_seconds"], DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS)
         self.assertEqual(deploy.call_args.kwargs["database_policy"], "preflight_and_apply")
 
+    def test_production_deploy_tool_uses_dry_run_default(self) -> None:
+        service, manager, _ = self.make_service()
+
+        with patch.object(manager, "deploy_production", return_value={"ok": True, "status": "dry_run"}) as deploy:
+            payload = service.call_tool("dev_env_deploy_production", {
+                "environment_id": "agent-hq-dev",
+                "lease_id": "lease-1",
+                "task_id": "426",
+                "actor": "release",
+                "expected_commit": "abc123",
+            })
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "dry_run")
+        self.assertEqual(deploy.call_args.args[:5], ("agent-hq-dev", "lease-1", "426", "release", "abc123"))
+        self.assertTrue(deploy.call_args.args[7])
+        self.assertEqual(deploy.call_args.args[8], DEFAULT_MCP_DEPLOY_TIMEOUT_SECONDS)
+
     def test_failure_class_errors_become_specific_callback_events(self) -> None:
         service, manager, _ = self.make_service()
         migration_error = {"stage": "deploy", "result": {"deploy": {"failure_class": "database_migration_failed", "phase": "db:migrate:preflight"}}}

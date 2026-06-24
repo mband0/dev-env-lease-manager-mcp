@@ -33,6 +33,7 @@ released leases and removed lock entries.
 - `dev_env_sweep_deploy_locks`
 - `dev_env_cancel_queue`
 - `dev_env_validate_qa`
+- `dev_env_deploy_production`
 - `dev_env_events`
 - `dev_env_callback_attempts`
 - `dev_env_cleanup_task_branch`
@@ -54,6 +55,27 @@ or `none` for narrower maintenance flows.
 Busy environment responses include owner task, agent, branch, commit, lease id,
 environment, and next action guidance. Agents must treat `environment_busy` as a
 blocked/waiting state and must not mutate the shared checkout manually.
+
+## Production Deploy
+
+`dev_env_deploy_production` is the explicit production release path. It requires
+`environment_id`, `lease_id`, `task_id`, `actor`, and `expected_commit`. Dry run
+defaults to `true` and validates the lease, task id, QA commit, production
+checkout safety, and whether the expected commit is reachable from
+`production_remote/production_branch` without mutating production.
+
+Real mode (`dry_run = false`) moves the lease from `deployed_for_qa` to
+`prod_deploying`, acquires a production deploy lock under
+`metadata.production_state_dir`, resets the production checkout to the exact
+approved commit, builds API/UI, runs configured database migration preflight and
+apply, restarts production PM2 services, runs health checks, verifies the
+checkout commit, then releases the lease as `done`. Failures after
+`prod_deploying` release the lease as `prod_failed` with the structured failure
+class and deploy payload.
+
+The tool refuses tracked dirty production checkouts and refuses untracked files
+outside the configured `metadata.production_allowed_untracked` patterns. It does
+not deploy a branch tip by implication.
 
 When `dev_env_deploy_worktree` is called with `queue_if_busy = true`,
 `environment_id` is the preferred target for that deployment pool. If the

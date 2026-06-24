@@ -114,7 +114,12 @@ Post review evidence only after `deployed_for_qa`.
 QA must call `dev_env_validate_qa` with task id and expected commit before
 testing. Commit or task mismatch is an environment integrity failure.
 
-QA failure uses `dev_env_mark_qa_failed`. Release starts production work with
-`dev_env_mark_prod_deploying`, uses `dev_env_mark_prod_failed` on production
-failure, and uses `dev_env_mark_done` only after production succeeds and the
-Agent HQ task is done.
+QA failure uses `dev_env_mark_qa_failed`. Release uses
+`dev_env_deploy_production` with `dry_run = true` first, then `dry_run = false`
+after the plan is acceptable. The production deploy tool owns the
+`prod_deploying -> done/prod_failed` lease transition, exact production checkout
+reset, build, database migration, PM2 restart, health check, and structured
+release evidence. The older `dev_env_mark_prod_deploying`,
+`dev_env_mark_prod_failed`, and `dev_env_mark_done` tools remain available for
+manual recovery, but normal release agents should not stitch those steps
+together by hand.

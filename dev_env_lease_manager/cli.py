@@ -101,6 +101,19 @@ def build_parser() -> argparse.ArgumentParser:
     qa.add_argument("--lease-id")
     qa.add_argument("--environment-id")
 
+    prod_deploy = sub.add_parser("deploy-production")
+    prod_deploy.add_argument("environment_id")
+    prod_deploy.add_argument("--lease-id", required=True)
+    prod_deploy.add_argument("--task-id", required=True)
+    prod_deploy.add_argument("--actor", required=True)
+    prod_deploy.add_argument("--expected-commit", required=True)
+    prod_deploy.add_argument("--services", default="both")
+    prod_deploy.add_argument("--no-health-check", action="store_true")
+    prod_deploy.add_argument("--dry-run", action="store_true", default=True)
+    prod_deploy.add_argument("--execute", action="store_true")
+    prod_deploy.add_argument("--timeout-seconds", type=int, default=1800)
+    prod_deploy.add_argument("--database-policy", default="preflight_and_apply", choices=["none", "status_only", "preflight_only", "preflight_and_apply"])
+
     deploy = sub.add_parser("deploy")
     deploy.add_argument("environment_id")
     deploy.add_argument("--task-id", required=True)
@@ -174,6 +187,18 @@ def main(argv: list[str] | None = None) -> int:
                 args.limit,
             ),
             "validate-qa": lambda: manager.validate_qa(args.task_id, args.commit, args.environment_id, args.lease_id),
+            "deploy-production": lambda: manager.deploy_production(
+                args.environment_id,
+                args.lease_id,
+                args.task_id,
+                args.actor,
+                args.expected_commit,
+                args.services,
+                not args.no_health_check,
+                False if args.execute else args.dry_run,
+                args.timeout_seconds,
+                args.database_policy,
+            ),
             "deploy": lambda: manager.lease_aware_deploy(
                 args.environment_id,
                 args.task_id,

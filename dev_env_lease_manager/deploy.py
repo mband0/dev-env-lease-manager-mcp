@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -143,6 +144,17 @@ def native_deploy_lock_stale_after_seconds(env: Dict[str, Any]) -> int:
     except (TypeError, ValueError):
         value = DEFAULT_DEPLOY_LOCK_STALE_AFTER_SECONDS
     return value if value > 0 else DEFAULT_DEPLOY_LOCK_STALE_AFTER_SECONDS
+
+
+def production_deploy_state_dir(env: Dict[str, Any]) -> Path:
+    metadata = env.get("metadata") or {}
+    return Path(expand_path(str(metadata.get("production_state_dir") or "~/.agent-hq-prod-deploy")))
+
+
+def production_deploy_lock_env(env: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = dict(env.get("metadata") or {})
+    metadata["state_dir"] = str(production_deploy_state_dir(env))
+    return {**env, "metadata": metadata}
 
 
 def _read_lock_metadata(path: Path) -> Dict[str, Any]:
@@ -878,3 +890,274 @@ class NativeDevDeployer:
                 "database_migration": migration_setup if "api" in service_list else None,
                 "health": health,
             }
+
+
+class NativeProductionDeployer(NativeDevDeployer):
+    """Exact-commit production deployer for Agent HQ-style repos."""
+
+    DEFAULT_ALLOWED_UNTRACKED = [
+        ".env",
+        ".env.*",
+        "api/.env",
+        "api/.env.*",
+        "ui/.env",
+        "ui/.env.*",
+        "node_modules/**",
+        "api/node_modules/**",
+        "ui/node_modules/**",
+        "api/dist/**",
+        "ui/.next/**",
+        "ui/out/**",
+        "agent-hq*.db",
+        "*.sqlite",
+        "*.sqlite3",
+        "*.log",
+        "logs/**",
+    ]
+
+    def _allowed_untracked_patterns(self, metadata: Dict[str, Any]) -> list[str]:
+        configured = metadata.get("production_allowed_untracked")
+        if isinstance(configured, list):
+            return [str(item) for item in configured if str(item).strip()]
+        return list(self.DEFAULT_ALLOWED_UNTRACKED)
+
+    def _checkout_safety(self, repo_path: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        status = self._git(repo_path, "status", "--porcelain=v1", "--untracked-files=all").stdout.strip()
+        diff = self._git(repo_path, "diff", "--quiet", check=False)
+        staged = self._git(repo_path, "diff", "--cached", "--quiet", check=False)
+        untracked = [
+            line.strip()
+            for line in self._git(repo_path, "ls-files", "--others", "--exclude-standard").stdout.splitlines()
+            if line.strip()
+        ]
+        patterns = self._allowed_untracked_patterns(metadata)
+        disallowed_untracked = [
+            path for path in untracked
+            if not any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+        ]
+        safety = {
+            "status": status.splitlines() if status else [],
+            "tracked_dirty": diff.returncode != 0 or staged.returncode != 0,
+            "untracked_files": untracked,
+            "allowed_untracked_patterns": patterns,
+            "disallowed_untracked": disallowed_untracked,
+        }
+        if safety["tracked_dirty"]:
+            raise NativeDeployError("production_checkout_dirty", {**safety, "failure_class": "checkout_failed"})
+        if disallowed_untracked:
+            raise NativeDeployError("production_checkout_untracked_files", {**safety, "failure_class": "checkout_failed"})
+        return safety
+
+    def _verify_expected_commit(
+        self,
+        repo_path: str,
+        remote: str,
+        branch: str,
+        expected_commit: str,
+        timeout_seconds: int,
+    ) -> Dict[str, Any]:
+        if not expected_commit:
+            raise NativeDeployError("expected_commit is required", {"failure_class": "checkout_failed"})
+        self._git(repo_path, "fetch", "--no-tags", remote, branch, timeout=timeout_seconds)
+        resolved = self._git(repo_path, "rev-parse", f"{expected_commit}^{{commit}}", timeout=timeout_seconds).stdout.strip()
+        remote_ref = f"{remote}/{branch}"
+        ancestor = self._git(repo_path, "merge-base", "--is-ancestor", resolved, remote_ref, timeout=timeout_seconds, check=False)
+        if ancestor.returncode != 0:
+            raise NativeDeployError(
+                "expected_commit_not_reachable_from_remote",
+                {
+                    "failure_class": "checkout_failed",
+                    "expected_commit": expected_commit,
+                    "resolved_commit": resolved,
+                    "remote_ref": remote_ref,
+                },
+            )
+        remote_head = self._git(repo_path, "rev-parse", remote_ref, timeout=timeout_seconds).stdout.strip()
+        return {
+            "expected_commit": expected_commit,
+            "resolved_commit": resolved,
+            "remote": remote,
+            "branch": branch,
+            "remote_ref": remote_ref,
+            "remote_head": remote_head,
+        }
+
+    def _ensure_production_package_scripts(self, repo_path: str, services: list[str]) -> None:
+        errors: list[str] = []
+        checks = [("api/package.json", ("build", "start"))] if "api" in services else []
+        if "ui" in services:
+            checks.append(("ui/package.json", ("build", "start")))
+        for package_name, scripts in checks:
+            package_path = Path(repo_path) / package_name
+            try:
+                package = json.loads(package_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise NativeDeployError(f"{package_name} could not be read", {"detail": str(exc)})
+            package_scripts = package.get("scripts", {})
+            for script in scripts:
+                if script not in package_scripts:
+                    errors.append(f"{package_name} missing {script} script")
+        if errors:
+            raise NativeDeployError("package_scripts_missing", {"errors": errors, "failure_class": "build_failed"})
+
+    def deploy(
+        self,
+        env: Dict[str, Any],
+        services: str = "both",
+        health_check: bool = True,
+        expected_commit: Optional[str] = None,
+        timeout_seconds: int = 1800,
+        database_policy: str = "preflight_and_apply",
+        dry_run: bool = True,
+        lock_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        metadata = env.get("metadata") or {}
+        production_repo_path = expand_path(str(metadata.get("production_repo_path") or metadata.get("canonical_root") or "~/agent-hq"))
+        state_dir = expand_path(str(metadata.get("production_state_dir") or "~/.agent-hq-prod-deploy"))
+        state_file = expand_path(str(metadata.get("production_state_file") or str(Path(state_dir) / "current-production-target.json")))
+        remote = str(metadata.get("production_remote") or "origin")
+        branch = str(metadata.get("production_branch") or "main")
+        api_name = str(metadata.get("production_pm2_api") or "agent-hq-api")
+        ui_name = str(metadata.get("production_pm2_ui") or "agent-hq-ui")
+        api_port = str(metadata.get("production_api_port") or 3501)
+        ui_port = str(metadata.get("production_ui_port") or 3500)
+        db_path = expand_path(str(metadata.get("production_db_path") or str(Path(production_repo_path) / "agent-hq.db")))
+        backup_dir = expand_path(str(metadata.get("production_backup_dir") or str(Path(state_dir) / "db-backups")))
+        database_policy = normalize_database_policy(str(metadata.get("production_database_policy") or metadata.get("database_policy") or database_policy))
+        service_list = normalize_services(services)
+
+        if not Path(production_repo_path).is_dir():
+            raise NativeDeployError("production_repo_path_not_found", {"production_repo_path": production_repo_path, "failure_class": "checkout_failed"})
+
+        lock_payload = {
+            "environment_id": env.get("id"),
+            "production_repo_path": production_repo_path,
+            "expected_commit": expected_commit,
+            "services": service_list,
+            "dry_run": dry_run,
+            **(lock_metadata or {}),
+        }
+        lock_env = production_deploy_lock_env(env)
+
+        def run_plan() -> Dict[str, Any]:
+            self._git(production_repo_path, "rev-parse", "--show-toplevel", timeout=timeout_seconds)
+            self._require_file(str(Path(production_repo_path) / "package.json"), "production repo root missing package.json")
+            self._require_file(str(Path(production_repo_path) / "api/package.json"), "production api/package.json missing")
+            self._require_file(str(Path(production_repo_path) / "ui/package.json"), "production ui/package.json missing")
+            self._ensure_production_package_scripts(production_repo_path, service_list)
+            checkout_safety = self._checkout_safety(production_repo_path, metadata)
+            commit_check = self._verify_expected_commit(production_repo_path, remote, branch, str(expected_commit or ""), timeout_seconds)
+            previous_sha = self._git(production_repo_path, "rev-parse", "HEAD", timeout=timeout_seconds, check=False).stdout.strip() or None
+            previous_api = self._capture_pm2(api_name)
+            previous_ui = self._capture_pm2(ui_name)
+            planned_actions = [
+                {"action": "fetch", "remote": remote, "branch": branch},
+                {"action": "reset_exact_commit", "commit": commit_check["resolved_commit"]},
+                {"action": "build", "services": service_list},
+                {"action": "database_migrations", "policy": database_policy, "db_path": db_path},
+                {"action": "restart_pm2", "services": service_list},
+                {"action": "health_check", "enabled": health_check, "services": service_list},
+            ]
+            base = {
+                "ok": True,
+                "mode": "production",
+                "dry_run": dry_run,
+                "production_repo_path": production_repo_path,
+                "services": service_list,
+                "previous": {"production_sha": previous_sha, "api": previous_api, "ui": previous_ui},
+                "checkout_safety": checkout_safety,
+                "commit_check": commit_check,
+                "planned_actions": planned_actions,
+                "database_policy": database_policy,
+            }
+            if dry_run:
+                return base
+
+            resolved_commit = str(commit_check["resolved_commit"])
+            self._git(production_repo_path, "reset", "--hard", resolved_commit, timeout=timeout_seconds)
+            shutil.rmtree(Path(production_repo_path) / "api/dist", ignore_errors=True)
+            shutil.rmtree(Path(production_repo_path) / "ui/.next", ignore_errors=True)
+
+            dependency_setup: Dict[str, Any] = {}
+            migration_setup: Optional[Dict[str, Any]] = None
+            if "api" in service_list:
+                api_dir = str(Path(production_repo_path) / "api")
+                dependency_setup["api"] = self._ensure_deps(api_dir, timeout_seconds)
+                self._run(["npm", "run", "build"], cwd=api_dir, timeout=timeout_seconds)
+                migration_setup = self._run_database_migrations(
+                    api_dir,
+                    db_path,
+                    backup_dir,
+                    api_port,
+                    resolved_commit,
+                    database_policy,
+                    timeout_seconds,
+                )
+                self._run(["pm2", "delete", api_name], timeout=60, check=False)
+                api_env = os.environ.copy()
+                api_env.update({
+                    "PORT": api_port,
+                    "AGENT_HQ_DB_PATH": db_path,
+                    "AGENT_HQ_APP_COMMIT": resolved_commit,
+                    "OPENCLAW_GATEWAY_URL": os.environ.get("OPENCLAW_GATEWAY_URL", "https://127.0.0.1:18789"),
+                    "OPENCLAW_HOOKS_TOKEN": os.environ.get("OPENCLAW_HOOKS_TOKEN", ""),
+                    "GATEWAY_TOKEN": os.environ.get("GATEWAY_TOKEN", ""),
+                    "GATEWAY_WS_URL": os.environ.get("GATEWAY_WS_URL", "wss://127.0.0.1:18789"),
+                    "GATEWAY_URL": os.environ.get("GATEWAY_URL", "https://localhost:18789"),
+                    "NODE_TLS_REJECT_UNAUTHORIZED": os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED", "0"),
+                })
+                self._run(["pm2", "start", "npm", "--name", api_name, "--cwd", api_dir, "--", "start"], env=api_env, timeout=timeout_seconds)
+
+            if "ui" in service_list:
+                ui_dir = str(Path(production_repo_path) / "ui")
+                dependency_setup["ui"] = self._ensure_deps(ui_dir, timeout_seconds)
+                self._run(["npm", "run", "build"], cwd=ui_dir, timeout=timeout_seconds)
+                self._run(["pm2", "delete", ui_name], timeout=60, check=False)
+                ui_env = os.environ.copy()
+                ui_env.update({
+                    "PORT": ui_port,
+                    "AGENT_HQ_INTERNAL_BASE_URL": f"http://localhost:{api_port}",
+                    "NEXT_PUBLIC_API_URL": f"http://localhost:{api_port}",
+                    "AGENT_HQ_APP_COMMIT": resolved_commit,
+                })
+                self._run(["pm2", "start", "npm", "--name", ui_name, "--cwd", ui_dir, "--", "run", "start"], env=ui_env, timeout=timeout_seconds)
+
+            health = self._health_check(service_list, api_port, ui_port) if health_check else {}
+            deployed_commit = self._git(production_repo_path, "rev-parse", "HEAD", timeout=timeout_seconds).stdout.strip()
+            if deployed_commit != resolved_commit:
+                raise NativeDeployError(
+                    "served commit did not match expected production commit",
+                    {"failure_class": "checkout_failed", "deployed_commit": deployed_commit, "expected_commit": resolved_commit},
+                )
+            state = {
+                "previous": base["previous"],
+                "current": {
+                    "production_repo_path": production_repo_path,
+                    "deployed_commit": deployed_commit,
+                    "services": service_list,
+                    "api": {"cwd": f"{production_repo_path}/api", "name": api_name, "args": ["start"]},
+                    "ui": {"cwd": f"{production_repo_path}/ui", "name": ui_name, "args": ["run", "start"]},
+                    "checkout_safety": checkout_safety,
+                    "dependency_setup": dependency_setup,
+                    "database_policy": database_policy,
+                    "database_migration": migration_setup if "api" in service_list else None,
+                    "health": health,
+                },
+            }
+            Path(state_file).parent.mkdir(parents=True, exist_ok=True)
+            Path(state_file).write_text(json.dumps(state, indent=2), encoding="utf-8")
+            return {
+                **base,
+                "dry_run": False,
+                "deployed_commit": deployed_commit,
+                "state_file": state_file,
+                "performed_actions": planned_actions,
+                "dependency_setup": dependency_setup,
+                "database_migration": migration_setup if "api" in service_list else None,
+                "health": health,
+            }
+
+        if dry_run:
+            return run_plan()
+        with NativeDeployLock(state_dir, lock_payload, lock_env):
+            return run_plan()

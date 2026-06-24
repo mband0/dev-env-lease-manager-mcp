@@ -170,6 +170,76 @@ class LeaseManagerTests(ManagerTestCase):
             "release",
         ])
 
+    def test_deploy_production_dry_run_does_not_change_lease_state(self) -> None:
+        manager, _ = self.make_manager()
+        lease = manager.acquire("agent-hq-dev", "426", "cinder", commit="abc123")["lease"]
+        manager.transition(lease["id"], "mark_deploying", "deploy")
+        manager.transition(lease["id"], "mark_deployed_for_qa", "deploy")
+
+        with patch("dev_env_lease_manager.manager.NativeProductionDeployer") as deployer:
+            deployer.return_value.deploy.return_value = {"ok": True, "dry_run": True, "planned_actions": []}
+            result = manager.deploy_production("agent-hq-dev", lease["id"], "426", "release", "abc123", dry_run=True)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "dry_run")
+        self.assertEqual(manager._lease(lease["id"])["status"], "deployed_for_qa")
+        deployer.return_value.deploy.assert_called_once()
+        self.assertTrue(deployer.return_value.deploy.call_args.kwargs["dry_run"])
+
+    def test_deploy_production_success_marks_done_with_evidence(self) -> None:
+        manager, _ = self.make_manager()
+        lease = manager.acquire("agent-hq-dev", "426", "cinder", commit="abc123")["lease"]
+        manager.transition(lease["id"], "mark_deploying", "deploy")
+        manager.transition(lease["id"], "mark_deployed_for_qa", "deploy")
+
+        with patch("dev_env_lease_manager.manager.NativeProductionDeployer") as deployer:
+            deployer.return_value.deploy.return_value = {
+                "ok": True,
+                "dry_run": False,
+                "deployed_commit": "abc123",
+                "services": ["api", "ui"],
+                "health": {"api": {"ok": True}, "ui": {"ok": True}},
+                "state_file": "/tmp/state.json",
+            }
+            result = manager.deploy_production("agent-hq-dev", lease["id"], "426", "release", "abc123", dry_run=False)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["release_reason"], "done")
+        self.assertEqual(result["production_evidence"]["deployed_commit"], "abc123")
+        events = manager.events(lease["id"])["events"]
+        self.assertEqual([event["event_type"] for event in events][-2:], ["mark_prod_deploying", "release"])
+
+    def test_deploy_production_failure_marks_prod_failed(self) -> None:
+        manager, _ = self.make_manager()
+        lease = manager.acquire("agent-hq-dev", "426", "cinder", commit="abc123")["lease"]
+        manager.transition(lease["id"], "mark_deploying", "deploy")
+        manager.transition(lease["id"], "mark_deployed_for_qa", "deploy")
+
+        with patch("dev_env_lease_manager.manager.NativeProductionDeployer") as deployer:
+            deployer.return_value.deploy.side_effect = NativeDeployError(
+                "api_health_failed",
+                {"failure_class": "api_health_failed", "health": {"api": {"ok": False}}},
+            )
+            result = manager.deploy_production("agent-hq-dev", lease["id"], "426", "release", "abc123", dry_run=False)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "prod_failed")
+        self.assertEqual(result["release_reason"], "prod_failed")
+        self.assertEqual(result["production_deploy"]["failure_class"], "api_health_failed")
+
+    def test_deploy_production_rejects_mismatched_commit_before_prod_state(self) -> None:
+        manager, _ = self.make_manager()
+        lease = manager.acquire("agent-hq-dev", "426", "cinder", commit="abc123")["lease"]
+        manager.transition(lease["id"], "mark_deploying", "deploy")
+        manager.transition(lease["id"], "mark_deployed_for_qa", "deploy")
+
+        result = manager.deploy_production("agent-hq-dev", lease["id"], "426", "release", "def456", dry_run=False)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "environment_integrity_failure")
+        self.assertEqual(manager._lease(lease["id"])["status"], "deployed_for_qa")
+
     def test_invalid_transition_fails_clearly(self) -> None:
         manager, _ = self.make_manager()
         lease = manager.acquire("agent-hq-dev", "426", "cinder")["lease"]
