@@ -1012,6 +1012,7 @@ class NativeProductionDeployer(NativeDevDeployer):
         lock_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         metadata = env.get("metadata") or {}
+        production_command = metadata.get("production_deploy_command")
         production_repo_path = expand_path(str(metadata.get("production_repo_path") or metadata.get("canonical_root") or "~/agent-hq"))
         state_dir = expand_path(str(metadata.get("production_state_dir") or "~/.agent-hq-prod-deploy"))
         state_file = expand_path(str(metadata.get("production_state_file") or str(Path(state_dir) / "current-production-target.json")))
@@ -1042,6 +1043,80 @@ class NativeProductionDeployer(NativeDevDeployer):
         def run_plan() -> Dict[str, Any]:
             self._git(production_repo_path, "rev-parse", "--show-toplevel", timeout=timeout_seconds)
             self._require_file(str(Path(production_repo_path) / "package.json"), "production repo root missing package.json")
+            if production_command:
+                checkout_safety = self._checkout_safety(production_repo_path, metadata)
+                commit_check = self._verify_expected_commit(production_repo_path, remote, branch, str(expected_commit or ""), timeout_seconds)
+                previous_sha = self._git(production_repo_path, "rev-parse", "HEAD", timeout=timeout_seconds, check=False).stdout.strip() or None
+                planned_actions = [
+                    {"action": "fetch", "remote": remote, "branch": branch},
+                    {"action": "reset_exact_commit", "commit": commit_check["resolved_commit"]},
+                    {"action": "run_production_command", "command": str(production_command)},
+                    {"action": "health_check", "enabled": health_check},
+                ]
+                base = {
+                    "ok": True,
+                    "mode": "production_command",
+                    "dry_run": dry_run,
+                    "production_repo_path": production_repo_path,
+                    "previous": {"production_sha": previous_sha},
+                    "checkout_safety": checkout_safety,
+                    "commit_check": commit_check,
+                    "planned_actions": planned_actions,
+                    "database_policy": database_policy,
+                }
+                if dry_run:
+                    return base
+                command_env = os.environ.copy()
+                command_env.update({
+                    "PRODUCTION_REPO_PATH": production_repo_path,
+                    "PRODUCTION_REMOTE": remote,
+                    "PRODUCTION_BRANCH": branch,
+                    "EXPECTED_COMMIT": str(commit_check["resolved_commit"]),
+                    "HEALTH_CHECK": "true" if health_check else "false",
+                    "SERVICES": ",".join(service_list),
+                })
+                completed = subprocess.run(
+                    str(production_command),
+                    shell=True,
+                    cwd=production_repo_path,
+                    env=command_env,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout_seconds,
+                )
+                if completed.returncode != 0:
+                    raise NativeDeployError("production_command_failed", {
+                        "failure_class": "process_restart_failed",
+                        "returncode": completed.returncode,
+                        "stdout": completed.stdout[-4000:],
+                        "stderr": completed.stderr[-4000:],
+                    })
+                deployed_commit = self._git(production_repo_path, "rev-parse", "HEAD", timeout=timeout_seconds).stdout.strip()
+                if deployed_commit != commit_check["resolved_commit"]:
+                    raise NativeDeployError("served commit did not match expected production commit", {
+                        "failure_class": "checkout_failed",
+                        "deployed_commit": deployed_commit,
+                        "expected_commit": commit_check["resolved_commit"],
+                    })
+                state = {
+                    "previous": base["previous"],
+                    "current": {
+                        "production_repo_path": production_repo_path,
+                        "deployed_commit": deployed_commit,
+                        "command": str(production_command),
+                        "stdout": completed.stdout[-4000:],
+                    },
+                }
+                Path(state_file).parent.mkdir(parents=True, exist_ok=True)
+                Path(state_file).write_text(json.dumps(state, indent=2), encoding="utf-8")
+                return {
+                    **base,
+                    "dry_run": False,
+                    "deployed_commit": deployed_commit,
+                    "state_file": state_file,
+                    "performed_actions": planned_actions,
+                    "stdout": completed.stdout[-4000:],
+                }
             self._require_file(str(Path(production_repo_path) / "api/package.json"), "production api/package.json missing")
             self._require_file(str(Path(production_repo_path) / "ui/package.json"), "production ui/package.json missing")
             self._ensure_production_package_scripts(production_repo_path, service_list)

@@ -409,6 +409,31 @@ class NativeDeployTests(unittest.TestCase):
         self.assertNotIn(["git", "-C", str(prod.resolve()), "reset", "--hard", "abc123"], commands)
         self.assertNotIn(["pm2", "delete", "agent-hq-api"], commands)
 
+    def test_command_production_dry_run_supports_single_app_repo(self) -> None:
+        _, _, prod, _ = self.make_layout()
+        commands: list[list[str]] = []
+        deployer = NativeProductionDeployer(self.fake_production_runner(prod, commands))
+
+        result = deployer.deploy(
+            {
+                "id": "agency-crm-dev",
+                "metadata": {
+                    "production_repo_path": str(prod),
+                    "production_state_dir": str(prod.parent / "agency-prod-state"),
+                    "production_deploy_command": "/opt/tools/deploy-agency-production",
+                },
+            },
+            health_check=True,
+            expected_commit="abc123",
+            dry_run=True,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["mode"], "production_command")
+        self.assertEqual(result["commit_check"]["resolved_commit"], "abc123")
+        self.assertEqual(result["planned_actions"][2]["action"], "run_production_command")
+        self.assertNotIn(["git", "-C", str(prod.resolve()), "reset", "--hard", "abc123"], commands)
+
     def test_production_deploy_refuses_commit_not_reachable_from_remote(self) -> None:
         _, _, prod, _ = self.make_layout()
         write_package(prod / "ui/package.json", {"build": "next build", "start": "next start"})
