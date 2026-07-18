@@ -68,8 +68,17 @@ exact recorded commit on the next available matching environment. New queued
 requests for the same task supersede older queued requests so stale commits do
 not deploy later.
 
-Normal lease release also sweeps the next queued deploy that can run on the
-released environment.
+Queued deployments require a full `commit` SHA. At enqueue time and again
+immediately before claim/deploy, `source_repo_path` must be a readable git
+worktree whose `git rev-parse HEAD` output exactly equals that SHA. A missing
+path, non-git directory, or mismatch is rejected with an actionable structured
+error. This prevents a recovery or project-manager workspace from enqueueing a
+different agent's task commit.
+
+Every terminal lease release path (success, deploy/QA/production failure,
+manual/forced release, and stale cleanup) wakes the next queued deploy that can
+run on the released environment. Wakeups are idempotent and reentrant wakeups
+are deferred so a failed queued deploy cannot recursively double-claim.
 Callers may still run `sweep-deploy-queue` manually for recovery or operator
 maintenance, but the expected path is that releasing the active lease promotes
 the next queued request automatically.

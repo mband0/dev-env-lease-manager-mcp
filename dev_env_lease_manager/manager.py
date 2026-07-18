@@ -6,6 +6,7 @@ import os
 import shlex
 import sqlite3
 import subprocess
+import threading
 from typing import Any, Dict, Iterable, Optional
 import urllib.error
 import urllib.parse
@@ -97,6 +98,9 @@ class LeaseManager:
     def __init__(self, config: LeaseManagerConfig):
         self.config = config
         self.conn = connect(config.data_path)
+        self._queue_wake_environments: set[str] = set()
+        self._queue_wake_pending: set[str] = set()
+        self._queue_wake_lock = threading.RLock()
         sync_environments(self.conn, config, utc_now())
 
     def close(self) -> None:
@@ -265,6 +269,82 @@ class LeaseManager:
             "stdout": completed.stdout.strip(),
             "stderr": completed.stderr.strip(),
         }
+
+    def _validate_deploy_source(self, source_repo_path: str, commit_sha: Optional[str]) -> Dict[str, Any]:
+        """Validate that a deploy source is a git worktree at exactly the requested commit."""
+        requested_path = str(source_repo_path or "").strip()
+        if not requested_path or not os.path.isdir(requested_path):
+            return {
+                "ok": False,
+                "error": "source_repo_path_not_found",
+                "source_repo_path": requested_path,
+                "message": "The deployment source directory does not exist.",
+                "next_action": "Enqueue from the active task's git worktree and retry.",
+            }
+        if not commit_sha or not str(commit_sha).strip():
+            return {
+                "ok": False,
+                "error": "commit_sha_required",
+                "source_repo_path": requested_path,
+                "message": "An exact commit_sha is required for queued deployments.",
+                "next_action": "Resolve git rev-parse HEAD in the active task worktree and enqueue that full SHA.",
+            }
+        head = self._git(requested_path, "rev-parse", "HEAD")
+        if head.returncode != 0:
+            return {
+                "ok": False,
+                "error": "source_repo_not_git_worktree",
+                "source_repo_path": requested_path,
+                "git": self._git_payload(head),
+                "message": "The deployment source is not a readable git worktree.",
+                "next_action": "Use the active task's git worktree, not a recovery or project-manager workspace.",
+            }
+        actual = head.stdout.strip()
+        expected = str(commit_sha).strip()
+        if actual != expected:
+            return {
+                "ok": False,
+                "error": "source_commit_mismatch",
+                "source_repo_path": requested_path,
+                "expected_commit_sha": expected,
+                "actual_head_sha": actual,
+                "message": "The deployment source HEAD does not exactly match commit_sha.",
+                "next_action": "Enqueue from the worktree that owns this task and exact commit; do not enqueue another agent's commit from a recovery/PM workspace.",
+            }
+        return {"ok": True, "source_repo_path": requested_path, "commit_sha": actual}
+
+    def _wake_deploy_queue(self, environment_id: str) -> Dict[str, Any]:
+        """Idempotently drain one newly available environment after a release.
+
+        A deploy failure can release a lease while this worker is already sweeping.
+        Record that wake as pending instead of recursively entering the worker.
+        """
+        env_id = str(environment_id)
+        with self._queue_wake_lock:
+            if env_id in self._queue_wake_environments:
+                self._queue_wake_pending.add(env_id)
+                return {"ok": True, "deferred": True, "reason": "queue_wake_already_running"}
+
+            self._queue_wake_environments.add(env_id)
+            sweeps: list[Dict[str, Any]] = []
+            try:
+                while True:
+                    self._queue_wake_pending.discard(env_id)
+                    sweep = self.sweep_deploy_queue("queue-worker", environment_id=env_id, limit=1)
+                    sweeps.append(sweep)
+                    if env_id not in self._queue_wake_pending:
+                        break
+                return {
+                    "ok": all(item.get("ok") for item in sweeps),
+                    "sweeps": sweeps,
+                    "processed": [entry for item in sweeps for entry in item.get("processed", [])],
+                    "skipped": [entry for item in sweeps for entry in item.get("skipped", [])],
+                }
+            except Exception as exc:
+                return {"ok": False, "error": "queue_wake_failed", "message": str(exc)}
+            finally:
+                self._queue_wake_pending.discard(env_id)
+                self._queue_wake_environments.discard(env_id)
 
     def _add_cleanup_check(self, checks: list[Dict[str, Any]], name: str, ok: bool,
                            detail: Optional[Dict[str, Any]] = None) -> None:
@@ -1358,8 +1438,9 @@ class LeaseManager:
         env = self._environment(environment_id)
         if not env:
             return {"ok": False, "error": "environment_not_found", "environment_id": environment_id}
-        if not os.path.isdir(source_repo_path):
-            return {"ok": False, "error": "source_repo_path_not_found", "source_repo_path": source_repo_path}
+        source_validation = self._validate_deploy_source(source_repo_path, commit)
+        if not source_validation.get("ok"):
+            return source_validation
 
         now = utc_now()
         queue_id = str(uuid4())
@@ -1564,10 +1645,7 @@ class LeaseManager:
         updated = self._lease(lease_id)
         result = {"ok": True, "status": to_status, "lease": updated, "release_reason": reason, "agent_hq_note": self.release_note(updated, message)}
         if sweep_queue_after_release:
-            try:
-                result["queue_sweep"] = self.sweep_deploy_queue("queue-worker", environment_id=lease["environment_id"], limit=1)
-            except Exception as exc:
-                result["queue_sweep"] = {"ok": False, "error": "queue_sweep_failed", "message": str(exc)}
+            result["queue_sweep"] = self._wake_deploy_queue(str(lease["environment_id"]))
         return result
 
     def force_release(self, actor: str, reason: str, lease_id: Optional[str] = None,
@@ -1589,10 +1667,7 @@ class LeaseManager:
         self._event(lease["id"], lease["environment_id"], lease["task_id"], actor, "force_release", from_status, "force_released", reason)
         result = {"ok": True, "status": "force_released", "lease": self._lease(lease["id"]), "release_reason": reason}
         if sweep_queue_after_release:
-            try:
-                result["queue_sweep"] = self.sweep_deploy_queue("queue-worker", environment_id=lease["environment_id"], limit=1)
-            except Exception as exc:
-                result["queue_sweep"] = {"ok": False, "error": "queue_sweep_failed", "message": str(exc)}
+            result["queue_sweep"] = self._wake_deploy_queue(str(lease["environment_id"]))
         return result
 
     def status(self, environment_id: Optional[str] = None, include_events: bool = False) -> Dict[str, Any]:
@@ -1677,7 +1752,7 @@ class LeaseManager:
                 actor,
                 "stale_released",
                 message or "stale lease released by MCP preflight cleanup",
-                sweep_queue_after_release=False,
+                sweep_queue_after_release=True,
             )
             if result.get("ok"):
                 released.append(result.get("lease"))
@@ -1874,7 +1949,7 @@ class LeaseManager:
                 actor,
                 "prod_failed",
                 deploy_payload.get("error", "production deploy failed"),
-                sweep_queue_after_release=False,
+                sweep_queue_after_release=True,
             )
             release["production_deploy"] = deploy_payload
             return release
@@ -1899,7 +1974,7 @@ class LeaseManager:
                     actor,
                     "deploy_failed",
                     deploy_payload.get("message") or deploy_payload.get("stderr") or "deploy command failed",
-                    sweep_queue_after_release=False,
+                    sweep_queue_after_release=True,
                 )
                 released["deploy"] = deploy_payload
                 return released
@@ -1929,7 +2004,7 @@ class LeaseManager:
                     actor,
                     "deploy_failed",
                     deploy_payload.get("error", "native deploy failed"),
-                    sweep_queue_after_release=False,
+                    sweep_queue_after_release=True,
                 )
                 released["deploy"] = deploy_payload
                 return released
@@ -1944,7 +2019,7 @@ class LeaseManager:
                     actor,
                     "deploy_failed",
                     served.stderr[-1000:] or "served commit command failed",
-                    sweep_queue_after_release=False,
+                    sweep_queue_after_release=True,
                 )
                 released["deploy"] = deploy_payload
                 return released
@@ -1955,7 +2030,7 @@ class LeaseManager:
                 actor,
                 "deploy_failed",
                 f"served commit {served_commit} did not match expected {commit}",
-                sweep_queue_after_release=False,
+                sweep_queue_after_release=True,
             )
             released["deploy"] = deploy_payload
             return released
@@ -2207,6 +2282,22 @@ class LeaseManager:
                     )
                 ]
                 processed.append({"queue": self._public_queue(failed_queue), "result": task_rejection, "callbacks": callbacks})
+                continue
+
+            source_validation = self._validate_deploy_source(
+                str(queue.get("source_repo_path") or ""),
+                queue.get("commit_sha"),
+            )
+            if not source_validation.get("ok"):
+                error = self._callback_error("validate_deploy_source", source_validation)
+                failed_queue = self._set_queue_status(queue["id"], "failed", error=error)
+                callbacks = [self._send_callback(
+                    failed_queue,
+                    "deploy_failed",
+                    f"Queued deploy {queue['id']} rejected because its source worktree or commit is invalid.",
+                    error=error,
+                )]
+                processed.append({"queue": self._public_queue(failed_queue), "result": source_validation, "callbacks": callbacks})
                 continue
 
             acquire = self.acquire(

@@ -131,12 +131,17 @@ class McpServerTests(unittest.TestCase):
         service, manager, tmp = self.make_service()
         source = Path(tmp.name) / "source"
         source.mkdir()
+        self.run_git("init", str(source))
+        self.git(source, "config", "user.email", "test@example.com")
+        self.git(source, "config", "user.name", "Test User")
+        commit = self.commit_file(source, "README.md", "queued source\n", "queued source")
         manager.acquire("agent-hq-dev", "425", "anchor")
         queued = service.call_tool("dev_env_deploy_worktree", {
             "environment_id": "agent-hq-dev",
             "task_id": "426",
             "actor": "cinder",
             "source_repo_path": str(source),
+            "commit": commit,
             "queue_if_busy": True,
         })["queue"]
 

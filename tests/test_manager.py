@@ -86,6 +86,17 @@ class ManagerTestCase(unittest.TestCase):
 
 
 class LeaseManagerTests(ManagerTestCase):
+    def setUp(self) -> None:
+        # Legacy queue tests use placeholder directories and synthetic commit
+        # names. Source integrity has dedicated real-git tests below.
+        self.source_validation_patch = patch.object(
+            LeaseManager,
+            "_validate_deploy_source",
+            return_value={"ok": True},
+        )
+        self.source_validation_patch.start()
+        self.addCleanup(self.source_validation_patch.stop)
+
     def test_acquire_blocks_second_owner_with_busy_shape(self) -> None:
         manager, _ = self.make_manager()
         first = manager.acquire("agent-hq-dev", "426", "cinder", "94", "Cinder", "task-426", "abc123")
