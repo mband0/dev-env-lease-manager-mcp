@@ -91,8 +91,11 @@ materialized MCP environment as `AGENT_HQ_MCP_API_KEY`, or from an explicit
 
 When callback settings are supplied, the lease manager posts Agent HQ external
 task events for `dev_deploy_queued`, `dev_deploying`, `deployed_for_qa`,
-`deploy_failed`, `cancelled`, and `superseded`. Known deploy failure classes are
-posted as specific events instead of generic `deploy_failed`: `database_backup_failed`,
+`deploy_failed`, `stale_lease_released`, `cancelled`, and `superseded`.
+`stale_lease_released` is emitted when MCP preflight cleanup auto-releases a
+heartbeat-expired lease, and includes `release_reason`, `prior_lease_status`,
+and `prior_deploy_status` for deterministic Agent HQ recovery. Known deploy
+failure classes are posted as specific events instead of generic `deploy_failed`: `database_backup_failed`,
 `database_migration_failed`, `database_integrity_failed`, `api_boot_failed`,
 `api_health_failed`, `ui_health_failed`, `process_restart_failed`, `checkout_failed`,
 and `build_failed`.

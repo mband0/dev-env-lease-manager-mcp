@@ -338,6 +338,74 @@ class LeaseManagerTests(ManagerTestCase):
         self.assertFalse(legacy_lock.exists())
         self.assertTrue(manager.status("agent-hq-dev")["environments"][0]["available"])
 
+    def test_mcp_preflight_cleanup_emits_stale_release_callback_and_fails_deploying_queue(self) -> None:
+        manager, tmp = self.make_manager(stale_after_seconds=1)
+        source = Path(tmp.name) / "source"
+        source.mkdir()
+        posted_payloads: list[dict[str, object]] = []
+
+        def capture_callback(request: object, timeout: int = 0) -> MockHttpResponse:
+            del timeout
+            data = getattr(request, "data", b"{}")
+            posted_payloads.append(json.loads(data.decode("utf-8")))
+            return MockHttpResponse({"ok": True, "received": True})
+
+        with patch("urllib.request.urlopen", side_effect=capture_callback):
+            queued = manager.enqueue_deploy_request(
+                "agent-hq-dev",
+                "426",
+                "cinder",
+                str(source),
+                branch="cinder/task-426",
+                commit="abc123",
+                callback_url="http://agent-hq.local",
+                callback_api_key="secret",
+            )
+            self.assertTrue(queued["ok"], queued)
+
+            queue_id = queued["queue"]["id"]
+            lease = manager.acquire(
+                "agent-hq-dev",
+                "426",
+                "queue-worker",
+                branch="cinder/task-426",
+                commit="abc123",
+                metadata={"source_repo_path": str(source), "queue_id": queue_id},
+            )["lease"]
+            manager._set_queue_status(queue_id, "deploying", lease_id=lease["id"])
+            manager.transition(lease["id"], "mark_deploying", "queue-worker")
+            old = (datetime.now(timezone.utc) - timedelta(seconds=120)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            manager.conn.execute("UPDATE leases SET heartbeat_at = ? WHERE id = ?", (old, lease["id"]))
+
+            cleanup = manager.mcp_preflight_cleanup()
+
+        self.assertTrue(cleanup["ok"])
+        released = cleanup["stale_leases"]["released"][0]
+        self.assertEqual(released["status"], "stale_released")
+        self.assertEqual(released["release_reason"], "stale_released")
+        self.assertTrue(released["callback"]["ok"])
+
+        stale_payload = posted_payloads[-1]
+        self.assertEqual(stale_payload["event"], "stale_lease_released")
+        self.assertEqual(stale_payload["task_id"], "426")
+        self.assertEqual(stale_payload["queue_id"], queue_id)
+        self.assertEqual(stale_payload["lease_id"], lease["id"])
+        self.assertEqual(stale_payload["environment_id"], "agent-hq-dev")
+        self.assertEqual(stale_payload["branch"], "cinder/task-426")
+        self.assertEqual(stale_payload["commit_sha"], "abc123")
+        self.assertEqual(stale_payload["release_reason"], "stale_released")
+        self.assertEqual(stale_payload["prior_lease_status"], "deploying")
+        self.assertEqual(stale_payload["prior_deploy_status"], "deploying")
+        self.assertIn("stale lease released", str(stale_payload["message"]))
+
+        queue = manager._queue_row(queue_id)
+        self.assertEqual(queue["status"], "failed")
+        self.assertEqual(queue["lease_id"], lease["id"])
+
+        attempts = manager.callback_attempts(queue_id=queue_id)["callback_attempts"]
+        self.assertEqual(attempts[0]["event"], "stale_lease_released")
+        self.assertTrue(attempts[0]["ok"])
+
     def test_status_reports_native_deploy_lock_and_sweep_removes_stale_legacy_lock(self) -> None:
         state_dir = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: shutil.rmtree(state_dir, ignore_errors=True))

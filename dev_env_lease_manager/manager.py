@@ -36,6 +36,7 @@ from .models import (
 
 
 CALLBACK_SOURCE = "dev_environment_lease_manager"
+STALE_LEASE_RELEASED_EVENT = "stale_lease_released"
 QA_FIXTURE_TASK_ID_PREFIX = "999"
 QA_FIXTURE_TASK_ID_LENGTH = 6
 PROTECTED_BRANCH_REFS = {
@@ -1071,7 +1072,8 @@ class LeaseManager:
 
     def _send_callback(self, queue: Dict[str, Any], event: str, message: str,
                        lease: Optional[Dict[str, Any]] = None,
-                       error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                       error: Optional[Dict[str, Any]] = None,
+                       extra_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         callback_url = self._callback_url(queue.get("callback_url"))
         env = self._environment(str(queue["environment_id"])) or {}
         lease_id = (lease or {}).get("id") or queue.get("lease_id") or queue["id"]
@@ -1105,6 +1107,8 @@ class LeaseManager:
             failure_phase = self._failure_phase_from_error(error)
             if failure_phase:
                 payload["phase"] = failure_phase
+        if extra_payload:
+            payload.update(extra_payload)
 
         if not callback_url:
             attempt_id = self._record_callback_attempt(
@@ -1199,6 +1203,81 @@ class LeaseManager:
                 payload=payload,
             )
             return {"ok": False, "error": str(exc), "payload": payload, "attempt_id": attempt_id}
+
+    def _queue_for_stale_lease_callback(self, lease: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = lease.get("metadata") or {}
+        queue_id = metadata.get("queue_id")
+        queue = self._queue_row(str(queue_id)) if queue_id else None
+        if not queue:
+            queue = row_to_dict(self.conn.execute(
+                """
+                SELECT *
+                FROM deploy_queue
+                WHERE lease_id = ?
+                ORDER BY updated_at DESC, requested_at DESC
+                LIMIT 1
+                """,
+                (lease["id"],),
+            ).fetchone())
+        if queue:
+            return queue
+
+        return {
+            "id": str(queue_id or lease["id"]),
+            "environment_id": lease["environment_id"],
+            "task_id": lease["task_id"],
+            "agent_id": lease.get("agent_id"),
+            "agent_name": lease.get("agent_name"),
+            "branch": lease.get("branch"),
+            "commit_sha": lease.get("commit_sha"),
+            "source_repo_path": metadata.get("source_repo_path"),
+            "status": lease.get("status"),
+            "callback_url": None,
+            "callback_api_key": None,
+            "metadata": {
+                **metadata,
+                "direct_deploy": metadata.get("direct_deploy", True),
+                "assigned_environment_id": lease.get("environment_id"),
+            },
+        }
+
+    def _send_stale_release_callback(self, lease: Dict[str, Any], released_lease: Dict[str, Any],
+                                     actor: str, message: str, prior_lease_status: str) -> Dict[str, Any]:
+        queue = self._queue_for_stale_lease_callback(lease)
+        prior_deploy_status = queue.get("status")
+        callback_queue = queue
+
+        if queue.get("status") == "deploying":
+            callback_queue = self._set_queue_status(
+                str(queue["id"]),
+                "failed",
+                lease_id=str(lease["id"]),
+                error={
+                    "reason": "stale_lease_released",
+                    "actor": actor,
+                    "message": message,
+                    "prior_lease_status": prior_lease_status,
+                    "prior_deploy_status": prior_deploy_status,
+                },
+            )
+
+        return self._send_callback(
+            callback_queue,
+            STALE_LEASE_RELEASED_EVENT,
+            message,
+            lease=released_lease,
+            error={
+                "reason": "stale_lease_released",
+                "release_reason": released_lease.get("release_reason"),
+                "prior_lease_status": prior_lease_status,
+                "prior_deploy_status": prior_deploy_status,
+            },
+            extra_payload={
+                "release_reason": released_lease.get("release_reason"),
+                "prior_lease_status": prior_lease_status,
+                "prior_deploy_status": prior_deploy_status,
+            },
+        )
 
     def _direct_deploy_callback_queue(self, *, environment_id: str, requested_environment_id: str,
                                       task_id: str, lease_id: str, agent_id: Optional[str],
@@ -1739,6 +1818,7 @@ class LeaseManager:
                 continue
             if not lease:
                 continue
+            prior_lease_status = str(lease["status"])
             if lease["status"] != "stale":
                 self.conn.execute("UPDATE leases SET status = 'stale' WHERE id = ?", (lease["id"],))
                 self._event(lease["id"], lease["environment_id"], lease["task_id"], actor, "mark_stale", lease["status"], "stale")
@@ -1747,15 +1827,30 @@ class LeaseManager:
                     marked.append(lease)
             if not lease:
                 continue
+            release_message = message or "stale lease released by MCP preflight cleanup"
             result = self.release(
                 lease["id"],
                 actor,
                 "stale_released",
-                message or "stale lease released by MCP preflight cleanup",
+                release_message,
                 sweep_queue_after_release=True,
             )
             if result.get("ok"):
-                released.append(result.get("lease"))
+                released_lease = result.get("lease")
+                callback = (
+                    self._send_stale_release_callback(
+                        lease,
+                        released_lease,
+                        actor,
+                        release_message,
+                        prior_lease_status,
+                    )
+                    if isinstance(released_lease, dict)
+                    else {"ok": False, "error": "released_lease_missing"}
+                )
+                released_entry = dict(released_lease) if isinstance(released_lease, dict) else {"id": lease["id"]}
+                released_entry["callback"] = callback
+                released.append(released_entry)
             else:
                 skipped.append({"lease_id": lease["id"], "environment_id": env["id"], "result": result})
         return {"ok": True, "marked_stale": marked, "released": released, "skipped": skipped}
